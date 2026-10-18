@@ -1,0 +1,6 @@
+telethon
+cryptg
+rich
+mutagen
+rapidfuzz
+numpy

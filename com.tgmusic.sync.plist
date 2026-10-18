@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Daily incremental index sync at 04:00 (runs on wake if the Mac was asleep). Install:
+     cp com.tgmusic.sync.plist ~/Library/LaunchAgents/ && launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tgmusic.sync.plist
+     Remove: launchctl bootout gui/$(id -u)/com.tgmusic.sync && rm ~/Library/LaunchAgents/com.tgmusic.sync.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.tgmusic.sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/dharanish.varadhan/Projects/tg-music-finder/.venv/bin/python</string>
+    <string>/Users/dharanish.varadhan/Projects/tg-music-finder/tgmusic.py</string>
+    <string>sync</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/dharanish.varadhan/Projects/tg-music-finder</string>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
+  <key>StandardOutPath</key><string>/Users/dharanish.varadhan/Projects/tg-music-finder/logs/sync.log</string>
+  <key>StandardErrorPath</key><string>/Users/dharanish.varadhan/Projects/tg-music-finder/logs/sync.log</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+</dict>
+</plist>

@@ -1,0 +1,12 @@
+# secrets: Telegram login = full account access
+config.json
+session.session*
+# local data
+index.db*
+downloads/
+plans/
+logs/
+.tg.lock
+.sync.lock
+.venv/
+__pycache__/
