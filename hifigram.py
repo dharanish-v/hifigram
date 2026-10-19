@@ -1,18 +1,18 @@
-"""Search all your Telegram chats/channels for audio, rank copies by real quality, download the best.
+"""hifigram: find the best-quality copy of any song across your Telegram channels.
 
 Usage:
-  tgmusic.py                                   interactive search + pick
-  tgmusic.py login                             one-time Telegram login
-  tgmusic.py sync                              index audio from all chats (resumable; later runs fetch only new posts)
-  tgmusic.py stats                             what's in the index
-  tgmusic.py search "q1" "q2" [--json]         fuzzy search the index, grouped by song, best copy first
-  tgmusic.py top 5 ["query"] [--chat NAME]     highest-quality unique songs
-  tgmusic.py verify CHAT:MSG ...               spectrum check for fake lossless (~4 MB each); also --verify on search/top/artist
-  tgmusic.py channels "tamil flac"             find public channels by name (nothing joined)
-  tgmusic.py scan @channel                     index a public channel without joining
-  tgmusic.py get CHAT:MSG [CHAT:MSG ...]       download specific files
-  tgmusic.py artist "name" "variant" --plan    best copy of every unique song -> plans/<artist>.json
-  tgmusic.py artist "name" --download          download that plan (resumable, skips what you have)
+  hifigram.py                                   interactive search + pick
+  hifigram.py login                             one-time Telegram login
+  hifigram.py sync                              index audio from all chats (resumable; later runs fetch only new posts)
+  hifigram.py stats                             what's in the index
+  hifigram.py search "q1" "q2" [--json]         fuzzy search the index, grouped by song, best copy first
+  hifigram.py top 5 ["query"] [--chat NAME]     highest-quality unique songs
+  hifigram.py verify CHAT:MSG ...               spectrum check for fake lossless (~4 MB each); also --verify on search/top/artist
+  hifigram.py channels "tamil flac"             find public channels by name (nothing joined)
+  hifigram.py scan @channel                     index a public channel without joining
+  hifigram.py get CHAT:MSG [CHAT:MSG ...]       download specific files
+  hifigram.py artist "name" "variant" --plan    best copy of every unique song -> plans/<artist>.json
+  hifigram.py artist "name" --download          download that plan (resumable, skips what you have)
 """
 import argparse
 import asyncio
@@ -72,7 +72,7 @@ def load_config(interactive):
     if CONFIG.exists():
         return json.loads(CONFIG.read_text())
     if not interactive:
-        sys.exit("No config.json. Run: tgmusic.py login")
+        sys.exit("No config.json. Run: hifigram.py login")
     err.print("Get api_id / api_hash at https://my.telegram.org → API development tools")
     cfg = {"api_id": int(input("api_id: ")), "api_hash": input("api_hash: ").strip()}
     CONFIG.write_text(json.dumps(cfg))
@@ -92,7 +92,7 @@ async def connect(interactive):
     else:
         await client.connect()
         if not await client.is_user_authorized():
-            sys.exit("Not logged in. Run: tgmusic.py login")
+            sys.exit("Not logged in. Run: hifigram.py login")
     return client
 
 
@@ -527,7 +527,7 @@ def client_lock():
         try:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            err.print("[yellow]Another tgmusic command is using Telegram; waiting for it to finish…[/]")
+            err.print("[yellow]Another hifigram command is using Telegram; waiting for it to finish…[/]")
             fcntl.flock(fh, fcntl.LOCK_EX)
         yield
 
@@ -1220,7 +1220,7 @@ async def cmd_channels(client, db, args):
         table.add_row(c["title"], c["username"], str(c["members"] or "?"), "yes" if c["joined"] else "",
                       "yes" if c["indexed"] else "")
     out.print(table)
-    out.print("Index one without joining: tgmusic.py scan @username")
+    out.print("Index one without joining: hifigram.py scan @username")
 
 
 async def cmd_scan(client, db, args):
@@ -1430,7 +1430,7 @@ async def main():
         return await cmd_stats(None, db, args)
     if getattr(args, "offline", False) and args.cmd in ("search", "top", "artist") and not getattr(args, "download", False):
         if not synced_once(db) and not db.execute("SELECT 1 FROM files LIMIT 1").fetchone():
-            sys.exit("Index empty. Run: tgmusic.py sync")
+            sys.exit("Index empty. Run: hifigram.py sync")
         return await {"search": cmd_search, "top": cmd_top, "artist": cmd_artist}[args.cmd](None, db, args)
     with client_lock():
         await run_command(args, db)

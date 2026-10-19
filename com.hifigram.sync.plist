@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- macOS: daily incremental index sync at 04:00 (runs on wake if the Mac was asleep).
+     Install (from the repo folder):
+       sed "s|__DIR__|$PWD|g" com.hifigram.sync.plist > ~/Library/LaunchAgents/com.hifigram.sync.plist
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hifigram.sync.plist
+     Remove:
+       launchctl bootout gui/$(id -u)/com.hifigram.sync && rm ~/Library/LaunchAgents/com.hifigram.sync.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.hifigram.sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__DIR__/.venv/bin/python</string>
+    <string>__DIR__/hifigram.py</string>
+    <string>sync</string>
+  </array>
+  <key>WorkingDirectory</key><string>__DIR__</string>
+  <key>StartCalendarInterval</key><dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
+  <key>StandardOutPath</key><string>__DIR__/logs/sync.log</string>
+  <key>StandardErrorPath</key><string>__DIR__/logs/sync.log</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>10</integer>
+</dict>
+</plist>
