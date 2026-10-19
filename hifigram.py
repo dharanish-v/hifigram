@@ -14,6 +14,8 @@ Usage:
   hifigram.py album "A" "B|alt" --plan          best copy of every track of each album -> plans/album-*.json
   hifigram.py album "A" "B" --download          download those albums (resumable, numbered files)
   hifigram.py stats --categories               formats, languages, lengths, versions, genres, decades, albums
+  hifigram.py inspect CHAT:MSG                 every stored version of a post, exactly as Telegram sent it
+  hifigram.py enrich                           re-read headers checked before every field was kept
   filters (search/top/artist/albums/album): --format flac,wav --lang tamil --version instrumental --no-version karaoke
                                              --length song --genre rock --decade 1990s
   hifigram.py get CHAT:MSG [CHAT:MSG ...]       download specific files
@@ -25,6 +27,7 @@ import asyncio
 import concurrent.futures
 import contextlib
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -35,6 +38,7 @@ import sys
 import tempfile
 import time
 import unicodedata
+import zlib
 from pathlib import Path
 
 import mutagen
@@ -55,6 +59,7 @@ CONFIG = HERE / "config.json"
 DOWNLOADS = HERE / "downloads"
 PLANS = HERE / "plans"
 DB = HERE / "index.db"
+BYTES_DB = HERE / "bytes.db"  # every byte ever read from a file, by (document, 128 KB block)
 
 LOSSLESS = {"flac", "alac", "wav", "aiff", "aif", "ape", "wv", "dsf", "dff"}
 AUDIO_EXTS = LOSSLESS | {"mp3", "m4a", "aac", "ogg", "opus", "oga", "wma"}
@@ -112,6 +117,62 @@ class ProbeCapReached(Exception):
 TRANSIENT = (TimeoutError, ConnectionError, concurrent.futures.TimeoutError, RPCError)
 
 
+class ByteStore:
+    """Every 128 KB block ever read from a Telegram file, kept forever (bytes.db). Reads hit it first."""
+
+    def __init__(self):
+        self.db = sqlite3.connect(BYTES_DB, timeout=60)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("CREATE TABLE IF NOT EXISTS blocks(doc_id INTEGER, idx INTEGER, at INTEGER, data BLOB, "
+                        "PRIMARY KEY(doc_id, idx))")
+
+    def get(self, doc_id, idx):
+        row = self.db.execute("SELECT data FROM blocks WHERE doc_id=? AND idx=?", (doc_id, idx)).fetchone()
+        return row[0] if row else None
+
+    def put(self, doc_id, idx, data):
+        self.db.execute("INSERT OR IGNORE INTO blocks VALUES(?,?,?,?)", (doc_id, idx, int(time.time()), data))
+        self.db.commit()
+
+
+_BYTES = None
+NET = {"bytes": 0}  # bytes actually pulled from Telegram this run (cache hits excluded)
+
+
+def byte_store():
+    global _BYTES
+    if _BYTES is None:
+        _BYTES = ByteStore()
+    return _BYTES
+
+
+async def get_blocks(client, doc, first, last):
+    """Blocks first..last of a document: from the byte cache, fetching only missing runs (then cached)."""
+    st, blocks, missing = byte_store(), {}, []
+    for i in range(first, last + 1):
+        d = st.get(doc.id, i)
+        if d is None:
+            missing.append(i)
+        else:
+            blocks[i] = d
+    runs = []
+    for i in missing:
+        if runs and i == runs[-1][-1] + 1:
+            runs[-1].append(i)
+        else:
+            runs.append([i])
+    for run in runs:
+        k = run[0]
+        async for chunk in client.iter_download(doc, offset=run[0] * BLOCK, request_size=BLOCK, limit=len(run),
+                                                file_size=doc.size):
+            data = bytes(chunk)
+            blocks[k] = data
+            st.put(doc.id, k, data)
+            NET["bytes"] += len(data)
+            k += 1
+    return blocks
+
+
 class RemoteFile:
     """Seekable read-only file over a Telegram document; fetches only the blocks that get read."""
 
@@ -120,19 +181,16 @@ class RemoteFile:
         self.size, self.pos, self.blocks, self.fetched = doc.size, 0, {}, 0
 
     async def _fetch(self, i):
-        async for chunk in self.client.iter_download(
-            self.doc, offset=i * BLOCK, request_size=BLOCK, limit=1, file_size=self.size
-        ):
-            return bytes(chunk)
-        return b""
+        before = NET["bytes"]
+        data = (await get_blocks(self.client, self.doc, i, i)).get(i, b"")
+        self.fetched += NET["bytes"] - before  # network bytes only; cache hits are free
+        return data
 
     def _block(self, i):
         if i not in self.blocks:
             if self.fetched >= PROBE_CAP:
                 raise ProbeCapReached()
-            data = asyncio.run_coroutine_threadsafe(self._fetch(i), self.loop).result(timeout=60)
-            self.blocks[i] = data
-            self.fetched += len(data)
+            self.blocks[i] = asyncio.run_coroutine_threadsafe(self._fetch(i), self.loop).result(timeout=60)
         return self.blocks[i]
 
     def read(self, n=-1):
@@ -201,9 +259,11 @@ def clean_tags(t):
 
 
 def vorbis_comments(data):
-    t = {}
+    """-> (normalised tags, every comment as written, encoder vendor string)"""
+    t, everything, vendor = {}, {}, None
     try:
         n = int.from_bytes(data[:4], "little")
+        vendor = data[4:4 + n].decode("utf-8", "replace")
         pos = 4 + n
         count = int.from_bytes(data[pos:pos + 4], "little")
         pos += 4
@@ -211,11 +271,30 @@ def vorbis_comments(data):
             ln = int.from_bytes(data[pos:pos + 4], "little")
             k, _, v = data[pos + 4:pos + 4 + ln].decode("utf-8", "replace").partition("=")
             pos += 4 + ln
+            everything.setdefault(k.upper(), []).append(v[:20000])
             if TAG_KEYS.get(k.upper()):
                 t.setdefault(TAG_KEYS[k.upper()], v)
     except Exception:
         pass
-    return clean_tags(t)
+    return clean_tags(t), everything, vendor
+
+
+def flac_picture(f, length):
+    """PICTURE block header only (type, mime, description, size in pixels); the image itself is skipped."""
+    start = f.tell()
+    h = f.read(min(length, 4096))
+    f.seek(start + length)
+    try:
+        be = lambda a: int.from_bytes(h[a:a + 4], "big")
+        ml = be(4)
+        mime = h[8:8 + ml].decode("latin-1")
+        dl = be(8 + ml)
+        desc = h[12 + ml:12 + ml + dl].decode("utf-8", "replace")
+        o = 12 + ml + dl
+        return {"type": be(0), "mime": mime, "desc": desc, "width": be(o), "height": be(o + 4), "depth": be(o + 8),
+                "bytes": be(o + 16)}
+    except Exception:
+        return {"bytes": length}
 
 
 def id3_text(data):
@@ -225,41 +304,107 @@ def id3_text(data):
 
 
 def id3_tags(f, tag_size, version):
-    """Read ID3v2.3/2.4 text frames up to the first picture (cover art is never fetched)."""
-    t, pos, end = {}, 10, 10 + tag_size
-    while pos + 10 <= end and version in (3, 4):
+    """Every ID3v2.3/2.4 frame: text, TXXX, comments, lyrics, URLs; pictures only by header (image never read).
+    -> (normalised tags, all frames, covers)"""
+    t, frames, covers, pos, end = {}, {}, [], 10, 10 + tag_size
+    while pos + 10 <= end and version in (3, 4) and len(frames) < 300:
         f.seek(pos)
         h = f.read(10)
         fid = h[:4].decode("latin-1", "replace")
-        if not fid.strip("\x00") or fid == "APIC":
+        if not fid.strip("\x00") or not fid.isalnum():
             break
         size = int.from_bytes(h[4:8], "big") if version == 3 else (
             (h[4] << 21) | (h[5] << 14) | (h[6] << 7) | h[7])
-        if fid in TAG_KEYS and 0 < size < 4096:
-            t.setdefault(TAG_KEYS[fid], id3_text(f.read(size)))
+        if size <= 0:
+            break
+        if fid == "APIC":
+            d = f.read(min(size, 256))
+            rest = d[1:]  # skip text-encoding byte
+            mime, _, rest = rest.partition(b"\x00")
+            covers.append({"mime": mime.decode("latin-1"), "type": rest[0] if rest else None, "bytes": size})
+        elif size < 256 * 1024:
+            d = f.read(size)
+            try:
+                if fid == "TXXX":
+                    desc, _, val = id3_text_raw(d)
+                    frames.setdefault(f"TXXX:{desc}", []).append(val)
+                elif fid in ("COMM", "USLT"):
+                    desc, _, val = id3_text_raw(d[:1] + d[4:])  # skip 3-byte language
+                    frames.setdefault(f"{fid}:{desc}", []).append(val[:20000])
+                elif fid.startswith("T"):
+                    frames.setdefault(fid, []).append(id3_text(d))
+                    if fid in TAG_KEYS:
+                        t.setdefault(TAG_KEYS[fid], id3_text(d))
+                elif fid.startswith("W"):
+                    frames.setdefault(fid, []).append(d.decode("latin-1", "replace").strip("\x00"))
+                else:
+                    frames.setdefault(fid, []).append({"bytes": size})
+            except Exception:
+                frames.setdefault(fid, []).append({"bytes": size})
+        else:
+            frames.setdefault(fid, []).append({"bytes": size})
         pos += 10 + size
-    return clean_tags(t)
+    return clean_tags(t), frames, covers
+
+
+def id3_text_raw(d):
+    """encoding byte + 'description\0value' -> (description, sep, value)"""
+    enc = d[0]
+    codec = {0: "latin-1", 1: "utf-16", 2: "utf-16-be", 3: "utf-8"}.get(enc, "latin-1")
+    sep = b"\x00\x00" if enc in (1, 2) else b"\x00"
+    raw = d[1:]
+    i = raw.find(sep)
+    if enc in (1, 2):
+        while i != -1 and i % 2:
+            i = raw.find(sep, i + 1)
+    desc, val = (raw[:i], raw[i + len(sep):]) if i != -1 else (b"", raw)
+    return desc.decode(codec, "replace").strip("\x00"), "", val.decode(codec, "replace").strip("\x00")
 
 
 def mp4_tags(f, moov):
+    """-> (normalised tags, every ilst item incl. freeform ----:mean:name, covers by size only)"""
     udta = mp4_child(f, *moov, b"udta")
     meta = mp4_child(f, *udta, b"meta") if udta else None
     ilst = mp4_child(f, meta[0] + 4, meta[1], b"ilst") if meta else None  # meta is a full box
-    t = {}
+    t, everything, covers = {}, {}, []
     for typ, s, e in (mp4_atoms(f, *ilst) if ilst else ()):
-        key = TAG_KEYS.get(typ)
-        if not key or e - s > 4096:
-            continue  # covr (cover art) is never read
+        name = typ.decode("latin-1")
+        if typ == b"covr":  # cover art: record, never read
+            for _, ds, de in mp4_atoms(f, s, e):
+                f.seek(ds)
+                kind = int.from_bytes(f.read(4), "big") & 0xFFFFFF
+                covers.append({"mime": {13: "image/jpeg", 14: "image/png"}.get(kind, str(kind)), "bytes": de - ds - 8})
+            continue
+        if e - s > 256 * 1024:
+            everything[name] = {"bytes": e - s}
+            continue
+        if typ == b"----":  # freeform: mean + name + data (ISRC, MusicBrainz ids, ...)
+            parts = {}
+            for ct, cs, ce in mp4_atoms(f, s, e):
+                f.seek(cs + (4 if ct in (b"mean", b"name") else 8))
+                parts[ct] = f.read(ce - cs - (4 if ct in (b"mean", b"name") else 8))
+            name = "----:" + parts.get(b"mean", b"").decode("utf-8", "replace") + ":" + parts.get(b"name", b"").decode("utf-8", "replace")
+            everything[name] = parts.get(b"data", b"").decode("utf-8", "replace")
+            continue
         data = mp4_child(f, s, e, b"data")
         if not data:
             continue
+        f.seek(data[0])
+        dtype = int.from_bytes(f.read(4), "big") & 0xFFFFFF
         f.seek(data[0] + 8)  # type + locale
         v = f.read(data[1] - data[0] - 8)
         if typ in (b"trkn", b"disk"):
-            t[key] = f"{int.from_bytes(v[2:4], 'big')}/{int.from_bytes(v[4:6], 'big')}"
+            val = f"{int.from_bytes(v[2:4], 'big')}/{int.from_bytes(v[4:6], 'big')}"
+        elif dtype == 1:
+            val = v.decode("utf-8", "replace")
+        elif dtype in (21, 22, 0) and len(v) <= 8:
+            val = int.from_bytes(v, "big")
         else:
-            t[key] = v.decode("utf-8", "replace")
-    return clean_tags(t)
+            val = v.hex()[:2000]
+        everything[name] = val
+        if TAG_KEYS.get(typ):
+            t[TAG_KEYS[typ]] = val
+    return clean_tags(t), everything, covers
 
 
 def probe_dsf(f):
@@ -276,18 +421,23 @@ def probe_dsf(f):
 def probe_flac(f):
     if f.read(4) != b"fLaC":
         return None
-    info, pos, tags = None, 4, {}
+    info, pos, tags, everything, vendor, covers = None, 4, {}, {}, None, []
     for _ in range(128):
         hdr = f.read(4)
         if len(hdr) < 4:
             return None
         last, btype, length = hdr[0] & 0x80, hdr[0] & 0x7F, int.from_bytes(hdr[1:4], "big")
         if btype == 0:
-            x = int.from_bytes(f.read(length)[10:18], "big")
+            d = f.read(length)
+            x = int.from_bytes(d[10:18], "big")
             sr, bits, total = x >> 44, ((x >> 36) & 0x1F) + 1, x & 0xFFFFFFFFF
-            info = {"sample_rate": sr, "bits": bits, "length": total / sr if sr else 0, "channels": ((x >> 41) & 7) + 1}
-        elif btype == 4 and length < 256 * 1024:  # VORBIS_COMMENT: album, track, genre, year (pictures skipped)
-            tags = vorbis_comments(f.read(length))
+            info = {"sample_rate": sr, "bits": bits, "length": total / sr if sr else 0, "channels": ((x >> 41) & 7) + 1,
+                    "samples": total, "md5": d[18:34].hex(),  # MD5 of the decoded audio: same audio = same MD5
+                    "min_block": int.from_bytes(d[0:2], "big"), "max_block": int.from_bytes(d[2:4], "big")}
+        elif btype == 4 and length < 1024 * 1024:  # VORBIS_COMMENT: every tag + encoder vendor string
+            tags, everything, vendor = vorbis_comments(f.read(length))
+        elif btype == 6:  # PICTURE: header only
+            covers.append(flac_picture(f, length))
         else:
             f.seek(length, 1)
         pos += 4 + length
@@ -296,20 +446,24 @@ def probe_flac(f):
     if info and info["length"]:
         info["kbps"] = round((f.size - pos) * 8 / info["length"] / 1000)  # audio only, no cover art
     if info:
-        info["tags"] = tags
+        info.update({"tags": tags, "all_tags": everything, "encoder": vendor, "covers": covers, "metadata_bytes": pos})
     return info
 
 
 def probe_mp3(f):
     h = f.read(10)
-    offset, tags = 0, {}
+    offset, tags, frames, covers = 0, {}, {}, []
     if h[:3] == b"ID3":
         size = (h[6] << 21) | (h[7] << 14) | (h[8] << 7) | h[9]
-        tags = id3_tags(f, size, h[3]) if not h[5] & 0x40 else {}
-        offset = 10 + size + (10 if h[5] & 0x10 else 0)  # skip the rest of the tag (cover art) without reading it
+        if not h[5] & 0x40:
+            tags, frames, covers = id3_tags(f, size, h[3])
+        offset = 10 + size + (10 if h[5] & 0x10 else 0)
     info = MPEGInfo(f, offset)
     return {"kbps": round(info.bitrate / 1000), "sample_rate": info.sample_rate, "length": info.length,
-            "vbr": info.bitrate_mode in (BitrateMode.VBR, BitrateMode.ABR), "channels": info.channels, "tags": tags}
+            "vbr": info.bitrate_mode in (BitrateMode.VBR, BitrateMode.ABR), "channels": info.channels, "tags": tags,
+            "all_tags": frames, "covers": covers, "id3_version": f"2.{h[3]}" if h[:3] == b"ID3" else None,
+            "encoder": getattr(info, "encoder_info", "") or None, "encoder_settings": getattr(info, "encoder_settings", "") or None,
+            "mpeg": f"{info.version}/layer{info.layer}", "mode": getattr(info, "mode", None), "sketchy": info.sketchy}
 
 
 def mp4_atoms(f, start, end):
@@ -370,29 +524,47 @@ def probe_mp4(f):
         length = dur / scale if scale else 0
         mdat = top.get(b"mdat")
         kbps = round((mdat[1] - mdat[0]) * 8 / length / 1000) if mdat and length else 0
+        tags, everything, covers = mp4_tags(f, top[b"moov"])
         return {"kbps": kbps, "sample_rate": sr, "bits": bits, "length": length, "alac": fmt == b"alac",
-                "channels": channels, "tags": mp4_tags(f, top[b"moov"])}
+                "channels": channels, "tags": tags, "all_tags": everything, "covers": covers,
+                "codec": fmt.decode(), "brands": [t.decode("latin-1") for t in top]}
     return None
 
 
 def probe_wav(f):
     if f.read(4) != b"RIFF" or (f.read(4), f.read(4))[1] != b"WAVE":
         return None
-    pos, fmt = 12, None
+    pos, fmt, info_tags, chunks = 12, None, {}, []
     for _ in range(64):
         f.seek(pos)
         h = f.read(8)
         if len(h) < 8:
             return None
         cid, size = h[:4], int.from_bytes(h[4:8], "little")
+        chunks.append(cid.decode("latin-1", "replace"))
+        if cid == b"LIST" and size < 1024 * 1024 and f.read(4) == b"INFO":  # INAM, IART, IPRD, IGNR, ICRD, ISFT...
+            d = f.read(size - 4)
+            i = 0
+            while i + 8 <= len(d):
+                k, ln = d[i:i + 4].decode("latin-1"), int.from_bytes(d[i + 4:i + 8], "little")
+                info_tags[k] = d[i + 8:i + 8 + ln].decode("utf-8", "replace").strip("\x00")
+                i += 8 + ln + (ln & 1)
+        elif cid == b"bext" and size < 64 * 1024:  # Broadcast WAV: description, originator, date, coding history
+            d = f.read(size)
+            info_tags["bext"] = {"description": d[:256].decode("latin-1", "replace").strip("\x00"),
+                                 "originator": d[256:288].decode("latin-1", "replace").strip("\x00"),
+                                 "date": d[320:330].decode("latin-1", "replace"),
+                                 "history": d[602:].decode("latin-1", "replace").strip("\x00")[:4000]}
         if cid == b"fmt ":
             d = f.read(16)
             fmt = {"sample_rate": int.from_bytes(d[4:8], "little"), "byte_rate": int.from_bytes(d[8:12], "little"),
                    "bits": int.from_bytes(d[14:16], "little"), "channels": int.from_bytes(d[2:4], "little")}
         elif cid == b"data" and fmt and fmt["byte_rate"]:
             length = size / fmt["byte_rate"]
+            wav_keys = {"IPRD": "album", "IART": "artist", "IGNR": "genre", "ICRD": "year", "IPRT": "track"}
             return {"kbps": round(fmt["byte_rate"] * 8 / 1000), "sample_rate": fmt["sample_rate"],
-                    "bits": fmt["bits"], "length": length, "channels": fmt["channels"]}
+                    "bits": fmt["bits"], "length": length, "channels": fmt["channels"], "all_tags": info_tags,
+                    "chunks": chunks, "tags": clean_tags({v: info_tags[k] for k, v in wav_keys.items() if k in info_tags})}
         pos += 8 + size + (size & 1)
     return None
 
@@ -433,6 +605,13 @@ def probe_other(f):
 
 
 def probe(f, ext):
+    info = _probe(f, ext)
+    if info:
+        info["full"] = True  # every header field kept (PROBE_VERSION 4+)
+    return info
+
+
+def _probe(f, ext):
     f.seek(0)
     if ext == "flac":
         return probe_flac(f)
@@ -475,9 +654,25 @@ CREATE TABLE IF NOT EXISTS extra_chats(chat_id INTEGER PRIMARY KEY, username TEX
 CREATE TABLE IF NOT EXISTS remote_queries(kind TEXT, q TEXT, at INTEGER, hits INTEGER, result TEXT, PRIMARY KEY(kind, q));
 CREATE TABLE IF NOT EXISTS verify(doc_id INTEGER PRIMARY KEY, result TEXT, version INTEGER, at INTEGER);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+-- every object Telegram returns, in its exact binary (TL) form, zlib-compressed; a new row only when the bytes
+-- change, so edits, view counts and reactions build up a history. Decode with `hifigram.py inspect`.
+CREATE TABLE IF NOT EXISTS raw(kind TEXT, key TEXT, hash TEXT, first_seen INTEGER, last_seen INTEGER, data BLOB,
+  PRIMARY KEY(kind, key, hash));
+-- convenience columns for every post (audio or not), refreshed whenever the post is seen
+CREATE TABLE IF NOT EXISTS post_meta(chat_id INTEGER, msg_id INTEGER, date INTEGER, media TEXT, views INTEGER,
+  forwards INTEGER, replies INTEGER, reactions TEXT, fwd_chat INTEGER, fwd_msg INTEGER, fwd_date INTEGER,
+  fwd_name TEXT, post_author TEXT, edit_date INTEGER, noforwards INTEGER, grouped_id INTEGER, text TEXT,
+  PRIMARY KEY(chat_id, msg_id));
+CREATE INDEX IF NOT EXISTS post_meta_date ON post_meta(chat_id, date);
+CREATE TABLE IF NOT EXISTS views_history(chat_id INTEGER, msg_id INTEGER, at INTEGER, views INTEGER, forwards INTEGER,
+  replies INTEGER, PRIMARY KEY(chat_id, msg_id, at));
+CREATE TABLE IF NOT EXISTS events(at INTEGER, kind TEXT, detail TEXT);
 """
-PROBE_VERSION = 3  # bump when probe code improves: failed probes from older versions get retried
-FILTERS = {"music": InputMessagesFilterMusic, "files": InputMessagesFilterDocument}
+PROBE_VERSION = 4  # bump when probe code improves: failed probes from older versions get retried
+FILTERS = {"all": None}  # chat scans take every message (text, photos, audio, service...), not just audio
+SEARCH_FILTERS = {"music": InputMessagesFilterMusic, "files": InputMessagesFilterDocument}
+FULLCHAT_TTL = 86400  # channel details (description, subscriber count...) re-read at most daily
+VIEWS_WINDOW = 30 * 86400  # posts younger than this get a views/forwards snapshot on each daily refresh
 
 
 def open_db():
@@ -488,11 +683,52 @@ def open_db():
     except sqlite3.OperationalError:
         pass
     db.executescript(SCHEMA)
-    try:  # added later: Telegram album/media-group id of each post
-        db.execute("ALTER TABLE files ADD COLUMN grouped_id INTEGER")
-    except sqlite3.OperationalError:
-        pass
+    for col in ("grouped_id INTEGER", "deleted_at INTEGER"):  # columns added after the first release
+        try:
+            db.execute(f"ALTER TABLE files ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
     return db
+
+
+def store_raw(db, kind, key, obj):
+    """Keep the exact bytes of a Telegram object. Same bytes as before -> only last_seen moves."""
+    try:
+        data = bytes(obj)
+    except Exception:
+        return
+    h, now = hashlib.sha1(data).hexdigest()[:20], int(time.time())
+    cur = db.execute("INSERT OR IGNORE INTO raw VALUES(?,?,?,?,?,?)", (kind, str(key), h, now, now, zlib.compress(data, 6)))
+    if not cur.rowcount:
+        db.execute("UPDATE raw SET last_seen=? WHERE kind=? AND key=? AND hash=?", (now, kind, str(key), h))
+
+
+def log_event(db, kind, detail):
+    db.execute("INSERT INTO events VALUES(?,?,?)", (int(time.time()), kind, str(detail)[:2000]))
+
+
+def post_facts(msg):
+    from telethon import utils
+    fwd = msg.fwd_from
+    fwd_chat = None
+    if fwd and fwd.from_id:
+        try:
+            fwd_chat = utils.get_peer_id(fwd.from_id)
+        except Exception:
+            pass
+    reactions = None
+    if getattr(msg, "reactions", None) and msg.reactions.results:
+        reactions = json.dumps([[getattr(r.reaction, "emoticon", None) or getattr(r.reaction, "document_id", None)
+                                 or type(r.reaction).__name__, r.count] for r in msg.reactions.results])
+    media = type(msg.media).__name__.replace("MessageMedia", "") if msg.media else ("text" if msg.message else None)
+    if type(msg).__name__ == "MessageService" or getattr(msg, "action", None):
+        media = "service:" + type(msg.action).__name__.replace("MessageAction", "")
+    return (msg.chat_id, msg.id, int(msg.date.timestamp()) if msg.date else None, media, msg.views, msg.forwards,
+            msg.replies.replies if getattr(msg, "replies", None) else None, reactions, fwd_chat,
+            getattr(fwd, "channel_post", None) if fwd else None, int(fwd.date.timestamp()) if fwd and fwd.date else None,
+            getattr(fwd, "from_name", None) if fwd else None, msg.post_author,
+            int(msg.edit_date.timestamp()) if msg.edit_date else None, int(bool(msg.noforwards)), msg.grouped_id,
+            (msg.message or "")[:4000] or None)
 
 
 MIME_EXT = {"flac": "flac", "x-flac": "flac", "mpeg": "mp3", "mp3": "mp3", "mp4": "m4a", "m4a": "m4a", "x-m4a": "m4a",
@@ -532,6 +768,7 @@ def chat_kind(chat):
 
 
 def remember_chat(db, chat_id, chat):
+    store_raw(db, "chat", chat_id, chat)
     title = getattr(chat, "title", None) or " ".join(filter(None, [getattr(chat, "first_name", None),
                                                                     getattr(chat, "last_name", None)])) or "?"
     db.execute("INSERT INTO chats(chat_id, title, username, kind) VALUES(?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET "
@@ -540,9 +777,17 @@ def remember_chat(db, chat_id, chat):
 
 
 def remember(db, msgs):
-    """Store every audio message we see, from any command."""
+    """Store every message we see, from any command: exact bytes + facts for all, a files row for audio."""
     n = 0
+    seen_chats = set()
     for msg in msgs:
+        if msg is None:
+            continue
+        store_raw(db, "message", f"{msg.chat_id}:{msg.id}", msg)
+        db.execute("INSERT OR REPLACE INTO post_meta VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", post_facts(msg))
+        if msg.chat and msg.chat_id not in seen_chats:
+            seen_chats.add(msg.chat_id)
+            store_raw(db, "chat", msg.chat_id, msg.chat)
         if not is_audio(msg):
             continue
         doc = msg.document
@@ -559,7 +804,7 @@ def remember(db, msgs):
 
 
 ROW_SQL = ("SELECT f.*, c.title AS chat_title, c.username, c.kind FROM files f "
-           "LEFT JOIN chats c ON c.chat_id = f.chat_id")
+           "LEFT JOIN chats c ON c.chat_id = f.chat_id WHERE f.deleted_at IS NULL")
 
 
 def item_from_row(r):
@@ -579,7 +824,7 @@ def item_from_row(r):
 def load_items(db, chat=None):
     sql, params = ROW_SQL, ()
     if chat:
-        sql += " WHERE c.title LIKE ?"
+        sql += " AND c.title LIKE ?"
         params = (f"%{chat}%",)
     return [item_from_row(r) for r in db.execute(sql, params)]
 
@@ -601,8 +846,8 @@ async def scan_chat(client, db, entity, chat_id, name, top, scans, label):
     fetched = 0
     for fname, flt in FILTERS.items():
         st = scans.get((chat_id, fname)) or {"chat_id": chat_id, "filt": fname, "newest": top, "oldest": 0, "done": 0}
-        tag = f"{label} {name[:30]} ({fname})"
-        n = 0
+        tag = f"{label} {name[:30]}"
+        n = seen = 0
         with err.status(f"{tag}…") as status:
             if not st["done"]:
                 batch = []
@@ -611,22 +856,82 @@ async def scan_chat(client, db, entity, chat_id, name, top, scans, label):
                     st["oldest"] = m.id
                     if len(batch) >= 200:
                         n += remember(db, batch)
+                        seen += len(batch)
                         batch = []
                         save_scan(db, st)
-                        status.update(f"{tag}: {n} audio…")
+                        status.update(f"{tag}: {seen} posts, {n} audio…")
                 n += remember(db, batch)
+                seen += len(batch)
                 st["done"] = 1
             else:
                 msgs = [m async for m in client.iter_messages(entity, filter=flt, min_id=st["newest"])]
                 n += remember(db, msgs)
+                seen += len(msgs)
                 st["newest"] = max([st["newest"], top] + [m.id for m in msgs])
             save_scan(db, st)
         fetched += n
-        if n:
-            err.print(f"{tag}: +{n} audio")
+        if n or seen:
+            err.print(f"{tag}: +{seen} posts, +{n} audio")
     db.execute("UPDATE chats SET top_id=? WHERE chat_id=?", (top, chat_id))
     db.commit()
     return fetched
+
+
+async def chat_details(client, db, entity, chat_id):
+    """Full channel/group info (description, subscribers, linked chat, pinned...), stored raw at most daily."""
+    from telethon.tl.functions.channels import GetFullChannelRequest
+    from telethon.tl.functions.messages import GetFullChatRequest
+    from telethon.tl.types import Channel, Chat
+    key = f"fullchat:{chat_id}"
+    last = db.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
+    if last and time.time() - int(last[0]) < FULLCHAT_TTL:
+        return
+    try:
+        if isinstance(entity, Channel):
+            full = await client(GetFullChannelRequest(entity))
+        elif isinstance(entity, Chat):
+            full = await client(GetFullChatRequest(entity.id))
+        else:
+            return
+        store_raw(db, "fullchat", chat_id, full)
+    except TRANSIENT:
+        return
+    except Exception as e:
+        log_event(db, "fullchat-error", f"{chat_id}: {e}")
+    db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, str(int(time.time()))))
+
+
+async def views_snapshot(client, db, entity, chat_id):
+    """Views/forwards/replies of recent channel posts, recorded over time (daily)."""
+    from telethon.tl.functions.messages import GetMessagesViewsRequest
+    from telethon.tl.types import Channel
+    if not (isinstance(entity, Channel) and entity.broadcast):
+        return
+    key = f"views:{chat_id}"
+    last = db.execute("SELECT v FROM meta WHERE k=?", (key,)).fetchone()
+    now = int(time.time())
+    if last and now - int(last[0]) < 86400:
+        return
+    ids = [r[0] for r in db.execute("SELECT msg_id FROM post_meta WHERE chat_id=? AND date>? "
+                                    "AND (media IS NULL OR media NOT LIKE 'service:%')", (chat_id, now - VIEWS_WINDOW))]
+    for i in range(0, len(ids), 100):
+        chunk = ids[i:i + 100]
+        try:
+            res = await client(GetMessagesViewsRequest(peer=entity, id=chunk, increment=False))
+        except TRANSIENT:
+            return
+        except Exception as e:
+            log_event(db, "views-error", f"{chat_id}: {e}")
+            return
+        store_raw(db, "views", f"{chat_id}:{chunk[0]}-{chunk[-1]}", res)
+        for mid, v in zip(chunk, res.views):
+            replies = v.replies.replies if v.replies else None
+            db.execute("INSERT OR IGNORE INTO views_history VALUES(?,?,?,?,?,?)",
+                       (chat_id, mid, now, v.views, v.forwards, replies))
+            db.execute("UPDATE post_meta SET views=?, forwards=?, replies=? WHERE chat_id=? AND msg_id=?",
+                       (v.views, v.forwards, replies, chat_id, mid))
+    db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, str(now)))
+    db.commit()
 
 
 async def sync(client, db):
@@ -640,10 +945,12 @@ async def sync(client, db):
     for i, d in enumerate(dialogs, 1):
         top = d.message.id if d.message else 0
         remember_chat(db, d.id, d.entity)
+        await chat_details(client, db, d.entity, d.id)
         if known.get(d.id) == top and done_all(d.id):
             skipped += 1
-            continue
-        fetched += await scan_chat(client, db, d.entity, d.id, d.name, top, scans, f"[{i}/{len(dialogs)}]")
+        else:
+            fetched += await scan_chat(client, db, d.entity, d.id, d.name, top, scans, f"[{i}/{len(dialogs)}]")
+        await views_snapshot(client, db, d.entity, d.id)
     joined = {d.id for d in dialogs}
     extra = [r for r in db.execute("SELECT chat_id, username FROM extra_chats") if r["chat_id"] not in joined]
     for r in extra:  # public channels indexed without joining: 1 call to see the newest post id
@@ -651,6 +958,7 @@ async def sync(client, db):
         latest = await client.get_messages(entity, limit=1)
         top = latest[0].id if latest else 0
         remember_chat(db, r["chat_id"], entity)
+        await chat_details(client, db, entity, r["chat_id"])
         if known.get(r["chat_id"]) == top and done_all(r["chat_id"]):
             skipped += 1
             continue
@@ -847,11 +1155,10 @@ def audio_layout(f, ext):
 
 
 async def fetch_range(client, doc, offset, length):
-    start = offset // BLOCK * BLOCK
-    blocks = -(-(offset + length - start) // BLOCK)
-    data = b"".join([bytes(c) async for c in client.iter_download(
-        doc, offset=start, request_size=BLOCK, limit=blocks, file_size=doc.size)])
-    return data[offset - start:offset - start + length]
+    first, last = offset // BLOCK, (offset + length - 1) // BLOCK
+    blocks = await get_blocks(client, doc, first, last)
+    data = b"".join(blocks.get(i, b"") for i in range(first, last + 1))
+    return data[offset - first * BLOCK:offset - first * BLOCK + length]
 
 
 async def decode(path, seek, seconds=3.5):
@@ -939,6 +1246,7 @@ def sample_bytes(info, start, end):
 async def verify_one(client, msg, it, info):
     """Remote: fetch only the two slices (+ headers) and analyse them."""
     loop = asyncio.get_running_loop()
+    net_before = NET["bytes"]
     rf = RemoteFile(client, loop, msg.document, it["file_name"])
     lay = await asyncio.to_thread(audio_layout, rf, it["ext"])
     if not lay or not info or not info.get("sample_rate"):
@@ -973,7 +1281,7 @@ async def verify_one(client, msg, it, info):
                 samples.append(await decode(path, dur * ((o - start) + length * 0.1) / (end - start), secs))
     res = await asyncio.to_thread(spectrum_verdict, samples, info["sample_rate"], info.get("bits") or 16)
     if res:
-        res["fetched_mb"] = round((length * len(offs) + rf.fetched) / 1e6, 2)
+        res["fetched_mb"] = round((NET["bytes"] - net_before) / 1e6, 2)
         res["channels"] = samples[0][1]
         await save_spectrogram(samples, info["sample_rate"], it["doc_id"])
     return res
@@ -1198,8 +1506,10 @@ async def fetch_messages(client, db, refs):
             for mid, m in zip(chunk, msgs):
                 if m and m.document:
                     found[f"{chat}:{mid}"] = m
-                else:
-                    db.execute("DELETE FROM files WHERE chat_id=? AND msg_id=?", (chat, mid))
+                else:  # never delete knowledge: mark it
+                    db.execute("UPDATE files SET deleted_at=? WHERE chat_id=? AND msg_id=? AND deleted_at IS NULL",
+                               (int(time.time()), chat, mid))
+                    log_event(db, "deleted", f"{chat}:{mid}")
     db.commit()
     return found
 
@@ -1580,7 +1890,7 @@ async def remote_search(client, db, queries, force=False):
             continue
         hits = 0
         with err.status(f"Not in index, asking Telegram: “{q}”…"):
-            for flt in FILTERS.values():
+            for flt in SEARCH_FILTERS.values():
                 hits += remember(db, [m async for m in client.iter_messages(None, search=q, filter=flt, limit=200)])
         db.execute("INSERT OR REPLACE INTO remote_queries VALUES('audio', ?, ?, ?, NULL)", (nq, now, hits))
         db.commit()
@@ -1640,7 +1950,7 @@ async def cmd_verify(client, db, args):
     items = []
     for ref in args.refs:
         chat, mid = ref.rsplit(":", 1)
-        r = db.execute(ROW_SQL + " WHERE f.chat_id=? AND f.msg_id=?", (int(chat), int(mid))).fetchone()
+        r = db.execute(ROW_SQL + " AND f.chat_id=? AND f.msg_id=?", (int(chat), int(mid))).fetchone()
         if r:
             items.append(item_from_row(r))
         else:
@@ -1718,7 +2028,7 @@ async def cmd_top(client, db, args):
 async def cmd_get(client, db, args):
     def row(ref):
         chat, mid = ref.rsplit(":", 1)
-        return db.execute(ROW_SQL + " WHERE f.chat_id=? AND f.msg_id=?", (int(chat), int(mid))).fetchone()
+        return db.execute(ROW_SQL + " AND f.chat_id=? AND f.msg_id=?", (int(chat), int(mid))).fetchone()
 
     missing = [r for r in args.refs if not row(r)]
     if missing:
@@ -1824,6 +2134,44 @@ async def cmd_album(client, db, args):
             await run_plan(client, db, plan)
 
 
+def decode_raw(blob):
+    from telethon.extensions import BinaryReader
+    return BinaryReader(zlib.decompress(blob)).tgread_object()
+
+
+async def cmd_inspect(client, db, args):
+    """Every stored version of a post (or chat / doc probe) — the exact data Telegram sent, decoded."""
+    def dump(o):
+        return json.dumps(o, default=lambda x: x.isoformat() if hasattr(x, "isoformat") else
+                          (f"<{len(x)} bytes>" if isinstance(x, (bytes, bytearray)) else str(x)), ensure_ascii=False, indent=1)
+    for ref in args.refs:
+        rows = db.execute("SELECT kind, key, first_seen, last_seen, data FROM raw WHERE key=? ORDER BY first_seen", (ref,)).fetchall()
+        if not rows:
+            err.print(f"[yellow]no raw data for[/] {ref}")
+        for r in rows:
+            out.print(f"[bold]{r['kind']} {r['key']}[/] seen {time.strftime('%Y-%m-%d %H:%M', time.localtime(r['first_seen']))}"
+                      f" → {time.strftime('%Y-%m-%d %H:%M', time.localtime(r['last_seen']))}")
+            print(dump(decode_raw(r["data"]).to_dict()))
+        chat, _, mid = ref.partition(":")
+        if mid.isdigit():
+            f = db.execute("SELECT doc_id FROM files WHERE chat_id=? AND msg_id=?", (int(chat), int(mid))).fetchone()
+            if f:
+                for table in ("probes", "verify"):
+                    row = db.execute(f"SELECT * FROM {table} WHERE doc_id=?", (f[0],)).fetchone()
+                    if row:
+                        out.print(f"[bold]{table}[/]")
+                        print(dump(dict(row)))
+
+
+async def cmd_enrich(client, db, args):
+    """Re-read headers of files probed before every field was kept (PROBE_VERSION < 4). Bytes are cached after."""
+    rows = [r["doc_id"] for r in db.execute("SELECT doc_id, info FROM probes WHERE info IS NOT NULL")
+            if "full" not in json.loads(r["info"])]
+    items = [it for it in load_items(db) if it["doc_id"] in set(rows)]
+    err.print(f"{len(rows)} older header checks to enrich")
+    await ensure_probed(client, db, items, ("full",))
+
+
 async def cmd_stats(client, db, args):
     q = lambda sql: db.execute(sql).fetchone()[0]
     out.print(f"audio posts {q('SELECT COUNT(*) FROM files')} · unique files {q('SELECT COUNT(DISTINCT doc_id) FROM files')}"
@@ -1831,6 +2179,13 @@ async def cmd_stats(client, db, args):
               f" · downloads {q('SELECT COUNT(*) FROM downloads')}"
               f" · chats scanned {q('SELECT COUNT(DISTINCT chat_id) FROM scans WHERE done=1')}"
               f" · pending scans {q('SELECT COUNT(*) FROM scans WHERE done=0')}")
+    out.print(f"raw objects {q('SELECT COUNT(*) FROM raw')} ({q('SELECT COUNT(DISTINCT key) FROM raw')} distinct)"
+              f" · posts with facts {q('SELECT COUNT(*) FROM post_meta')} · views snapshots {q('SELECT COUNT(*) FROM views_history')}"
+              f" · soft-deleted {q('SELECT COUNT(*) FROM files WHERE deleted_at IS NOT NULL')} · events {q('SELECT COUNT(*) FROM events')}")
+    if BYTES_DB.exists():
+        b = sqlite3.connect(BYTES_DB)
+        n, size = b.execute("SELECT COUNT(*), COALESCE(SUM(LENGTH(data)),0) FROM blocks").fetchone()
+        out.print(f"byte cache {n} blocks · {size / 1e6:.1f} MB")
     for r in db.execute("SELECT c.title, COUNT(*) n FROM files f JOIN chats c ON c.chat_id=f.chat_id "
                         "GROUP BY f.chat_id ORDER BY n DESC LIMIT 15"):
         out.print(f"  {r['n']:>7}  {r['title']}")
@@ -1873,6 +2228,9 @@ async def main():
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("login")
     sub.add_parser("sync")
+    ins = sub.add_parser("inspect")
+    ins.add_argument("refs", nargs="+", help="CHAT:MSG (or a chat id) — every stored version, decoded")
+    sub.add_parser("enrich")
     st = sub.add_parser("stats")
     st.add_argument("--categories", action="store_true", help="format/language/length/version/genre/decade/albums")
     s = sub.add_parser("search")
@@ -1946,6 +2304,8 @@ async def main():
     db = open_db()
     if args.cmd == "stats":
         return await cmd_stats(None, db, args)
+    if args.cmd == "inspect":
+        return await cmd_inspect(None, db, args)
     if getattr(args, "offline", False) and args.cmd in ("search", "top", "artist", "albums", "album") and not getattr(args, "download", False):
         if not synced_once(db) and not db.execute("SELECT 1 FROM files LIMIT 1").fetchone():
             sys.exit("Index empty. Run: hifigram.py sync")
@@ -1971,6 +2331,8 @@ async def run_command(args, db):
             await cmd_get(client, db, args)
         elif args.cmd == "artist":
             await cmd_artist(client, db, args)
+        elif args.cmd == "enrich":
+            await cmd_enrich(client, db, args)
         elif args.cmd == "albums":
             await cmd_albums(client, db, args)
         elif args.cmd == "album":
