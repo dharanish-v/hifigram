@@ -91,6 +91,13 @@ sed "s|__DIR__|$PWD|g" com.hifigram.sync.plist > ~/Library/LaunchAgents/com.hifi
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hifigram.sync.plist
 ```
 
+### Claude Code skill
+
+`.claude/skills/hifigram/SKILL.md` teaches [Claude Code](https://claude.com/claude-code) to drive hifigram. Ask in plain
+language ("find the best copy of …", "plan all songs by …") and it handles spelling variants, quality checks and
+review steps. It loads automatically inside this repo. To use it anywhere, copy it to `~/.claude/skills/hifigram/`
+and set `HIFIGRAM_DIR` to your checkout.
+
 ## How quality is ranked
 
 1. Lossless beats lossy.
