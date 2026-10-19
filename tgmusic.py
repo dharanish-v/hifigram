@@ -16,6 +16,7 @@ Usage:
 """
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import fcntl
 import io
@@ -36,7 +37,7 @@ from rapidfuzz import fuzz, process
 from rich.console import Console
 from rich.table import Table
 from telethon import TelegramClient
-from telethon.errors import PhoneNumberInvalidError
+from telethon.errors import PhoneNumberInvalidError, RPCError
 from telethon.tl.types import (
     DocumentAttributeAudio,
     InputMessagesFilterDocument,
@@ -97,6 +98,14 @@ async def connect(interactive):
 
 # ---------- partial-download file for header probes ----------
 
+class ProbeCapReached(Exception):
+    pass
+
+
+# network trouble: never cache as a result, retry on a later run
+TRANSIENT = (TimeoutError, ConnectionError, concurrent.futures.TimeoutError, RPCError)
+
+
 class RemoteFile:
     """Seekable read-only file over a Telegram document; fetches only the blocks that get read."""
 
@@ -114,7 +123,7 @@ class RemoteFile:
     def _block(self, i):
         if i not in self.blocks:
             if self.fetched >= PROBE_CAP:
-                raise IOError("probe cap reached")
+                raise ProbeCapReached()
             data = asyncio.run_coroutine_threadsafe(self._fetch(i), self.loop).result(timeout=60)
             self.blocks[i] = data
             self.fetched += len(data)
@@ -158,7 +167,7 @@ def probe_flac(f):
         if btype == 0:
             x = int.from_bytes(f.read(length)[10:18], "big")
             sr, bits, total = x >> 44, ((x >> 36) & 0x1F) + 1, x & 0xFFFFFFFFF
-            info = {"sample_rate": sr, "bits": bits, "length": total / sr if sr else 0}
+            info = {"sample_rate": sr, "bits": bits, "length": total / sr if sr else 0, "channels": ((x >> 41) & 7) + 1}
         else:
             f.seek(length, 1)
         pos += 4 + length
@@ -177,7 +186,7 @@ def probe_mp3(f):
         offset = 10 + size + (10 if h[5] & 0x10 else 0)  # skip tag (cover art) without reading it
     info = MPEGInfo(f, offset)
     return {"kbps": round(info.bitrate / 1000), "sample_rate": info.sample_rate, "length": info.length,
-            "vbr": info.bitrate_mode in (BitrateMode.VBR, BitrateMode.ABR)}
+            "vbr": info.bitrate_mode in (BitrateMode.VBR, BitrateMode.ABR), "channels": info.channels}
 
 
 def mp4_atoms(f, start, end):
@@ -231,13 +240,15 @@ def probe_mp4(f):
         if fmt not in (b"alac", b"mp4a"):
             continue
         bits, sr = int.from_bytes(entry[26:28], "big"), int.from_bytes(entry[32:34], "big")
+        channels = int.from_bytes(entry[24:26], "big")
         if fmt == b"alac" and entry[40:44] == b"alac":  # ALACSpecificConfig: real depth + rate (>65535 Hz)
             cfg = entry[48:]
-            bits, sr = cfg[5], int.from_bytes(cfg[20:24], "big")
+            bits, sr, channels = cfg[5], int.from_bytes(cfg[20:24], "big"), cfg[9]
         length = dur / scale if scale else 0
         mdat = top.get(b"mdat")
         kbps = round((mdat[1] - mdat[0]) * 8 / length / 1000) if mdat and length else 0
-        return {"kbps": kbps, "sample_rate": sr, "bits": bits, "length": length, "alac": fmt == b"alac"}
+        return {"kbps": kbps, "sample_rate": sr, "bits": bits, "length": length, "alac": fmt == b"alac",
+                "channels": channels}
     return None
 
 
@@ -254,11 +265,11 @@ def probe_wav(f):
         if cid == b"fmt ":
             d = f.read(16)
             fmt = {"sample_rate": int.from_bytes(d[4:8], "little"), "byte_rate": int.from_bytes(d[8:12], "little"),
-                   "bits": int.from_bytes(d[14:16], "little")}
+                   "bits": int.from_bytes(d[14:16], "little"), "channels": int.from_bytes(d[2:4], "little")}
         elif cid == b"data" and fmt and fmt["byte_rate"]:
             length = size / fmt["byte_rate"]
             return {"kbps": round(fmt["byte_rate"] * 8 / 1000), "sample_rate": fmt["sample_rate"],
-                    "bits": fmt["bits"], "length": length}
+                    "bits": fmt["bits"], "length": length, "channels": fmt["channels"]}
         pos += 8 + size + (size & 1)
     return None
 
@@ -275,6 +286,7 @@ def probe_adts(f):
         if idx >= len(ADTS_RATES):
             return None
         sr = ADTS_RATES[idx]
+        ch = ((data[pos + 2] & 1) << 2) | (data[pos + 3] >> 6)
         n = ((data[pos + 3] & 3) << 11) | (data[pos + 4] << 3) | (data[pos + 5] >> 5)
         if n < 7:
             return None
@@ -282,7 +294,8 @@ def probe_adts(f):
     if frames < 10:
         return None
     kbps = total / frames * 8 * sr / 1024 / 1000
-    return {"kbps": round(kbps), "sample_rate": sr, "length": f.size * 8 / (kbps * 1000), "estimated": True}
+    return {"kbps": round(kbps), "sample_rate": sr, "length": f.size * 8 / (kbps * 1000), "estimated": True,
+            "channels": ch}
 
 
 def probe_other(f):
@@ -293,7 +306,7 @@ def probe_other(f):
     codec = getattr(i, "codec", "") or ""
     return {"kbps": round((getattr(i, "bitrate", 0) or 0) / 1000), "sample_rate": getattr(i, "sample_rate", 0),
             "bits": getattr(i, "bits_per_sample", 0), "length": getattr(i, "length", 0),
-            "alac": codec.startswith("alac")}
+            "alac": codec.startswith("alac"), "channels": getattr(i, "channels", 0)}
 
 
 def probe(f, ext):
@@ -535,6 +548,7 @@ def assess(item, info, ver=None):
     A spectrum verify result (ver) overrides what the header claims."""
     ext, size = item["ext"], item["size"]
     item["probed"] = bool(info)
+    item["channels"] = (info or {}).get("channels") or (ver or {}).get("channels")
     if info and info.get("length") and not (info.get("estimated") and item["duration"]):
         item["duration"] = round(info["length"])
     dur = item["duration"]
@@ -564,6 +578,7 @@ def assess(item, info, ver=None):
                 item["label"] += f" ⚠ really {rb}/{rsr / 1000:g}"
             else:
                 item["label"] += " ? maybe 320k source" if ver["verdict"] == "suspect" else " ✓"
+                item["score"] += 0.5 if ver["verdict"] == "genuine" else 0  # proven beats merely claimed
     else:
         fmt = {"m4a": "AAC", "oga": "OGG"}.get(ext, ext.upper())
         vbr = "V" if (info or {}).get("vbr") else ""
@@ -571,17 +586,31 @@ def assess(item, info, ver=None):
         eff = kbps * CODEC_WEIGHT.get(ext, 1.0)
         item["score"] = eff
         item["tier"] = "320" if eff >= 300 else "256" if eff >= 240 else "192" if eff >= 180 else "low"
+    ch = item["channels"]
+    if ch and ch != 2:
+        item["label"] += " mono" if ch == 1 else f" {ch - 1}.1" if ch in (6, 8) else f" {ch}ch"
     return item
 
 
-async def ensure_probed(client, db, items):
-    """Header-probe only documents never probed before (or failed with older probe code); cache every result."""
+def stereo_only(items):
+    """Keep mono/stereo; drop surround (5.1 etc). Unknown channel count is kept."""
+    return [it for it in items if (it.get("channels") or 2) <= 2]
+
+
+async def ensure_probed(client, db, items, need_channels=False):
+    """Header-probe only documents never probed before (or failed with older probe code); cache every result.
+    need_channels: also re-read the header of older probes that lack the channel count (--stereo)."""
     if client is None:  # --offline: cached results only
         return apply_probes(db, items)
     have = {r["doc_id"]: r for r in db.execute("SELECT doc_id, info, version FROM probes")}
+    vers = {r["doc_id"]: r["result"] for r in db.execute("SELECT doc_id, result FROM verify")}
     need = {}
     for it in items:
         row = have.get(it["doc_id"])
+        if row and need_channels and row["info"] and "channels" not in json.loads(row["info"]):
+            if not json.loads(vers.get(it["doc_id"]) or "{}").get("channels"):
+                need.setdefault(it["doc_id"], it)
+            continue
         if row and (row["info"] or row["version"] >= PROBE_VERSION):
             continue
         need.setdefault(it["doc_id"], it)
@@ -600,6 +629,9 @@ async def ensure_probed(client, db, items):
                 f = RemoteFile(client, loop, msg.document, it["file_name"])
                 try:
                     info = await asyncio.to_thread(probe, f, it["ext"])
+                except TRANSIENT as e:
+                    err.print(f"[yellow]network trouble, will retry next run[/] {it['ref']}: {e}")
+                    return
                 except Exception:
                     info = None
             db.execute("INSERT OR REPLACE INTO probes VALUES(?,?,?,?)",
@@ -790,6 +822,7 @@ async def verify_one(client, msg, it, info):
     res = await asyncio.to_thread(spectrum_verdict, samples, info["sample_rate"], info.get("bits") or 16)
     if res:
         res["fetched_mb"] = round((length * len(offs) + rf.fetched) / 1e6, 2)
+        res["channels"] = samples[0][1]
         await save_spectrogram(samples, info["sample_rate"], it["doc_id"])
     return res
 
@@ -815,6 +848,7 @@ async def verify_local(db, path, it):
             res = await asyncio.to_thread(spectrum_verdict, samples, info["sample_rate"], info.get("bits") or 16)
             if res:
                 res["fetched_mb"] = 0
+                res["channels"] = samples[0][1]
                 await save_spectrogram(samples, info["sample_rate"], it["doc_id"])
             db.execute("INSERT OR REPLACE INTO verify VALUES(?,?,?,?)",
                        (it["doc_id"], json.dumps(res) if res else None, VERIFY_VERSION, int(time.time())))
@@ -850,6 +884,9 @@ async def verify_items(client, db, items):
         async with sem:
             try:
                 res = await verify_one(client, msg, it, infos.get(it["doc_id"]))
+            except TRANSIENT as e:
+                err.print(f"[yellow]network trouble, will retry next run[/] {it['ref']}: {e}")
+                return
             except Exception as e:
                 err.print(f"[yellow]verify failed[/] {it['ref']}: {e}")
                 res = None
@@ -928,7 +965,7 @@ def group(items, strip=()):
     """Cluster copies of the same song: similar cleaned title and duration within 3s. Best copy first.
     The same document posted in several chats counts once."""
     seen, uniq = set(), []
-    for it in sorted(items, key=lambda x: -x["score"]):
+    for it in sorted(items, key=lambda x: (-x["score"], -x["duration"])):
         if it["doc_id"] not in seen:
             seen.add(it["doc_id"])
             uniq.append(it)
@@ -1069,7 +1106,7 @@ def artist_matches(it, variants):
     return any(norm_text(v) in hay or norm_text(v).replace(" ", "") in squashed for v in variants)
 
 
-async def build_plan(client, db, variants, verify=False):
+async def build_plan(client, db, variants, verify=False, stereo=False):
     items = apply_probes(db, match(load_items(db), variants))
     # probe only what can change the pick: lossless copies, or lossy copies of songs with no lossless copy
     groups = group(items, strip=variants)
@@ -1077,7 +1114,9 @@ async def build_plan(client, db, variants, verify=False):
     for g in groups:
         lossless = [it for it in g if it["lossless"]]
         to_probe += lossless or g
-    await ensure_probed(client, db, to_probe)
+    await ensure_probed(client, db, to_probe, stereo)
+    if stereo:
+        items = stereo_only(items)
     groups = group(items, strip=variants)
     if verify:
         groups = await verify_best(client, db, items, lambda its: group(its, strip=variants))
@@ -1233,7 +1272,9 @@ async def cmd_search(client, db, args):
     if (not items or args.remote) and not args.offline:
         if await remote_search(client, db, args.queries, force=args.remote):
             items = match(load_items(db, args.chat), args.queries)
-    items = await ensure_probed(client, db, items) if not args.no_probe else apply_probes(db, items)
+    items = await ensure_probed(client, db, items, args.stereo) if not args.no_probe else apply_probes(db, items)
+    if args.stereo:
+        items = stereo_only(items)
     groups = group(items)[:args.limit]
     if args.verify:  # only the top 10 song groups (each check fetches ~0.5-4 MB)
         top = await verify_best(client, db, [i for g in groups[:10] for i in g], group)
@@ -1250,11 +1291,20 @@ async def cmd_top(client, db, args):
     items = load_items(db, args.chat)
     if args.queries:
         items = match(items, args.queries)
+    items = [it for it in items if it["duration"] >= args.min_length]
     apply_probes(db, items)
     # shortlist: everything already probed + highest estimated bitrate lossless candidates (true hi-res is far ahead)
     unprobed = sorted((it for it in items if not it["probed"]), key=lambda it: (-it["lossless"], -it["kbps"]))
-    shortlist = [it for it in items if it["probed"]] + unprobed[:max(100, args.n * 20)]
-    shortlist = await ensure_probed(client, db, shortlist)
+    shortlist = [it for it in items if it["probed"]]
+    batch = max(100, args.n * 20)
+    while True:  # with --stereo, surround files drop out: widen the shortlist until n songs remain
+        shortlist += unprobed[:batch]
+        unprobed = unprobed[batch:]
+        shortlist = await ensure_probed(client, db, shortlist, args.stereo)
+        if args.stereo:
+            shortlist = stereo_only(shortlist)
+        if not args.stereo or len(group(shortlist)) >= args.n * 3 or not unprobed or client is None:
+            break
     groups = group(shortlist)[:args.n]
     if args.verify:  # fakes drop out, next-best copies/songs move up and get verified too
         groups = (await verify_best(client, db, shortlist, lambda its: group(its)[:args.n]))[:args.n]
@@ -1291,7 +1341,7 @@ async def cmd_artist(client, db, args):
         err.print(f"Using saved plan {path} ({plan['songs']} songs)")
     else:
         await prepare(client, db, args)
-        plan, path = await build_plan(client, db, args.names, verify=args.verify)
+        plan, path = await build_plan(client, db, args.names, verify=args.verify, stereo=args.stereo)
         if args.json:
             print(json.dumps(plan | {"plan_file": str(path)}, ensure_ascii=False, indent=1))
         else:
@@ -1342,14 +1392,17 @@ async def main():
     s.add_argument("--no-probe", action="store_true", help="skip real-quality header check")
     s.add_argument("--offline", action="store_true", help="don't sync first, never call Telegram")
     s.add_argument("--remote", action="store_true", help="also ask Telegram (default: only when index has nothing)")
-    s.add_argument("--verify", action="store_true", help="spectrum-check best copies for fakes (~4 MB each, cached)")
+    s.add_argument("--verify", action="store_true", help="spectrum-check best copies for fakes (~1-5 MB each, cached)")
+    s.add_argument("--stereo", action="store_true", help="skip surround (5.1 etc) files")
     t = sub.add_parser("top")
     t.add_argument("n", type=int, nargs="?", default=5)
     t.add_argument("queries", nargs="*")
     t.add_argument("--chat")
+    t.add_argument("--min-length", type=int, default=60, help="skip tracks shorter than this many seconds")
     t.add_argument("--json", action="store_true")
     t.add_argument("--offline", action="store_true")
-    t.add_argument("--verify", action="store_true", help="spectrum-check for fakes (~4 MB each, cached)")
+    t.add_argument("--verify", action="store_true", help="spectrum-check for fakes (~1-5 MB each, cached)")
+    t.add_argument("--stereo", action="store_true", help="skip surround (5.1 etc) files")
     v = sub.add_parser("verify")
     v.add_argument("refs", nargs="+")
     v.add_argument("--json", action="store_true")
@@ -1368,7 +1421,8 @@ async def main():
     a.add_argument("--replan", action="store_true", help="with --download: rebuild plan first")
     a.add_argument("--json", action="store_true")
     a.add_argument("--offline", action="store_true")
-    a.add_argument("--verify", action="store_true", help="spectrum-check best copy of each song (~4 MB each, cached)")
+    a.add_argument("--verify", action="store_true", help="spectrum-check best copy of each song (~1-5 MB each, cached)")
+    a.add_argument("--stereo", action="store_true", help="skip surround (5.1 etc) files")
     args = p.parse_args()
 
     db = open_db()
