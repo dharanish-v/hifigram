@@ -1171,8 +1171,9 @@ def safe_name(s):
 
 
 def file_name_for(it):
-    if it.get("name_prefix"):  # album: "03 - Title.flac"
+    if it.get("name_prefix"):  # album: "03 - Title.flac" ("(From Movie)" is redundant inside the album folder)
         base = it["title"] or re.sub(r"^\s*\d{1,3}\s*[-._)]\s*", "", Path(it["file_name"]).stem) or it.get("norm") or "audio"
+        base = FROM_RE.sub("", base).strip() or base
         return f"{safe_name(it['name_prefix'] + unicodedata.normalize('NFKC', base))}.{it['ext'] or 'bin'}"
     base = " - ".join(filter(None, [it["performer"], it["title"]])) or Path(it["file_name"]).stem or it.get("norm") or "audio"
     return f"{safe_name(unicodedata.normalize('NFKC', base))}.{it['ext'] or 'bin'}"
