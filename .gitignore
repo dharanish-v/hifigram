@@ -10,3 +10,4 @@ logs/
 .sync.lock
 .venv/
 __pycache__/
+spectrograms/

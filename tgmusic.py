@@ -18,7 +18,9 @@ import argparse
 import asyncio
 import contextlib
 import fcntl
+import io
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -544,7 +546,7 @@ def assess(item, info, ver=None):
         bits, sr = (info or {}).get("bits") or 0, (info or {}).get("sample_rate") or 0
         if bits and sr:
             item["label"] = f"{fmt} {bits}/{sr / 1000:g}"
-            item["score"] = 10000 + bits * 100 + sr / 1000
+            item["score"] = 10000 + min(bits, 24) * 100 + sr / 1000  # >24 bits: no real recording has them
         else:
             item["label"] = f"{fmt} ~{kbps}k"
             item["score"] = 10000 + kbps / 100
@@ -555,9 +557,9 @@ def assess(item, info, ver=None):
                 item["score"] = ver["eff_kbps"]
                 item["tier"] = "320" if ver["eff_kbps"] >= 300 else "256" if ver["eff_kbps"] >= 240 else "low"
                 item["label"] += f" ⚠ fake: lossy source ~{ver['eff_kbps']}k"
-            elif ver["verdict"] == "upsampled" or ver.get("padded16"):
+            elif ver.get("real_bits", bits) < bits or ver.get("real_rate", sr) < sr:
                 rb, rsr = ver["real_bits"], ver["real_rate"]
-                item["score"] = 10000 + rb * 100 + rsr / 1000
+                item["score"] = 10000 + min(rb, 24) * 100 + rsr / 1000
                 item["tier"] = "hires" if rb > 16 and rsr > 48000 else "lossless"
                 item["label"] += f" ⚠ really {rb}/{rsr / 1000:g}"
             else:
@@ -612,12 +614,19 @@ async def ensure_probed(client, db, items):
 
 
 # ---------- fake detection (spectrum verify) ----------
-# Decodes ~6 s from the middle of the file (about 4 MB fetched, never the whole file) and looks for a brick-wall
-# cutoff: MP3/AAC encoders cut at 16-20 kHz, upsampling leaves nothing above the source's Nyquist (22.05/24 kHz).
-# Also checks whether "24-bit" samples are really 16-bit padded with zeros. Results are cached per document.
+# Decodes ~3.5 s at two points (35% and 65%) of the song. Only those two slices are fetched, sized from the bitrate
+# (~0.5-2 MB for typical files, never the whole file), and analysed together:
+#   - brick-wall cutoff: MP3/AAC encoders cut at 16-20 kHz
+#   - empty ultrasonics: upsampling leaves nothing above the source's Nyquist (22.05/24 kHz)
+#   - padded bits: "24/32-bit" samples whose low 8 or 16 bits are always zero (also catches 32-bit float made
+#     from 24/16-bit audio: those values sit exactly on the 24/16-bit grid)
+# A spectrogram PNG is saved for every check (spectrograms/<doc_id>.png). Results are cached per document;
+# downloaded files are checked locally for free.
 
-VERIFY_VERSION = 1
-SAMPLE_BYTES = 4 * 1024 * 1024
+VERIFY_VERSION = 2
+SAMPLE_POINTS = (0.35, 0.65)
+SAMPLE_SECONDS = 4.5  # fetched per point; 3.5 s of it is decoded
+SPECTRO_DIR = HERE / "spectrograms"
 
 
 def audio_layout(f, ext):
@@ -661,18 +670,37 @@ async def fetch_range(client, doc, offset, length):
     return data[offset - start:offset - start + length]
 
 
-def spectrum_verdict(pcm, channels, sr, claimed_bits):
+async def decode(path, seek, seconds=3.5):
+    """-> (pcm s32le bytes, channels). Never downmix: mixing would put fake data in the low bits."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", *(["-ss", f"{seek:.2f}"] if seek else []), "-i", str(path), "-t", str(seconds),
+        "-f", "s32le", "-", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    pcm, log = await proc.communicate()
+    m = re.search(r"Audio: .*?, \d+ Hz, (mono|stereo|(\d+) channels|(\d)\.(\d))", log.decode(errors="ignore"))
+    ch = 2 if not m else 1 if m[1] == "mono" else 2 if m[1] == "stereo" else int(m[2]) if m[2] else int(m[3]) + int(m[4])
+    return pcm, ch
+
+
+def spectrum_verdict(samples, sr, claimed_bits):
+    """samples: [(pcm, channels)]. Averages the spectrum of all samples, checks the low bits of all samples."""
     import numpy as np
-    x = np.frombuffer(pcm[:len(pcm) // (4 * channels) * 4 * channels], dtype="<i4").reshape(-1, channels)
-    padded16 = claimed_bits > 16 and np.count_nonzero(x & 0xFF00) < len(x) * 0.002
-    mono = x.astype(np.float64).mean(axis=1) / 2 ** 31
-    n = 8192
-    frames = [mono[i:i + n] for i in range(0, len(mono) - n, n // 2)]
-    if len(frames) < 8:
+    xs = [np.frombuffer(p[:len(p) // (4 * c) * 4 * c], dtype="<i4").reshape(-1, c) for p, c in samples if p]
+    xs = [x for x in xs if len(x)]
+    if not xs:
         return None
+    allx = np.concatenate([x.ravel() for x in xs])
+    thr = len(allx) * 0.002
+    real_bits = 16 if np.count_nonzero(allx & 0xFFFF) < thr else 24 if np.count_nonzero(allx & 0xFF) < thr else 32
+    real_bits = min(real_bits, claimed_bits)
+    n = 8192
     win = np.hanning(n)
-    power = np.mean([np.abs(np.fft.rfft(fr * win)) ** 2 for fr in frames], axis=0)
-    db = 10 * np.log10(power + 1e-30)
+    spectra = []
+    for x in xs:
+        mono = x.astype(np.float64).mean(axis=1) / 2 ** 31
+        spectra += [np.abs(np.fft.rfft(mono[i:i + n] * win)) ** 2 for i in range(0, len(mono) - n, n // 2)]
+    if len(spectra) < 8:
+        return None
+    db = 10 * np.log10(np.mean(spectra, axis=0) + 1e-30)
     freqs = np.fft.rfftfreq(n, 1 / sr)
     nyq = sr / 2
 
@@ -686,8 +714,7 @@ def spectrum_verdict(pcm, channels, sr, claimed_bits):
         below, above = band(f - 1500, f - 200), band(f + 200, f + 1500)
         if below is not None and above is not None and below - above > best:
             cutoff, best = float(f), below - above
-    res = {"cutoff": cutoff, "padded16": bool(padded16), "real_bits": 16 if padded16 else claimed_bits,
-           "real_rate": sr}
+    res = {"cutoff": cutoff, "real_bits": real_bits, "real_rate": sr, "claimed_bits": claimed_bits}
     if cutoff is not None and cutoff < 16500:
         res |= {"verdict": "lossy-source", "eff_kbps": 128}
     elif cutoff is not None and cutoff < 19200:
@@ -703,56 +730,102 @@ def spectrum_verdict(pcm, channels, sr, claimed_bits):
             if ref is not None and hf is not None and ref - hf > 60:
                 edge = next((float(f) for f in np.arange(19000, 30000, 100) if (band(f, f + 300) or -999) < ref - 30), None)
                 res |= {"verdict": "upsampled", "real_rate": 44100 if edge and edge < 23300 else 48000, "cutoff": edge}
-    if padded16 and res["verdict"] == "genuine":
-        res["verdict"] = "upsampled"
+    if res["verdict"] == "genuine" and real_bits < claimed_bits:
+        res["verdict"] = "padded"
     return res
 
 
-async def verify_one(client, db, msg, it, info):
+async def save_spectrogram(samples, sr, doc_id):
+    pcm, ch = samples[0][0] + b"".join(p for p, c in samples[1:] if c == samples[0][1]), samples[0][1]
+    if not pcm:
+        return
+    SPECTRO_DIR.mkdir(exist_ok=True)
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-v", "quiet", "-y", "-f", "s32le", "-ar", str(sr), "-ac", str(ch), "-i", "-",
+        "-lavfi", "showspectrumpic=s=1200x500:legend=1:scale=log", str(SPECTRO_DIR / f"{doc_id}.png"),
+        stdin=asyncio.subprocess.PIPE)
+    await proc.communicate(pcm)
+
+
+def sample_bytes(info, start, end):
+    kbps = info.get("kbps") or (end - start) * 8 / max(info.get("length") or 1, 1) / 1000
+    return int(min(max(kbps * 1000 / 8 * SAMPLE_SECONDS + 65536, 256 * 1024), 2.5 * 1024 * 1024, end - start))
+
+
+async def verify_one(client, msg, it, info):
+    """Remote: fetch only the two slices (+ headers) and analyse them."""
     loop = asyncio.get_running_loop()
     rf = RemoteFile(client, loop, msg.document, it["file_name"])
     lay = await asyncio.to_thread(audio_layout, rf, it["ext"])
     if not lay or not info or not info.get("sample_rate"):
         return None
     start, end, extra = lay
-    length = min(SAMPLE_BYTES, end - start)
-    mid = start + max(0, (end - start - length) // 2)
-    chunk = await fetch_range(client, msg.document, mid, length)
+    length = sample_bytes(info, start, end)
+    dur = info.get("length") or it["duration"]
+    secs = min(3.5, 0.8 * length / max(end - start, 1) * dur)  # decode only audio we actually fetched
+    offs = [start + int((end - start - length) * p) for p in SAMPLE_POINTS]
+    chunks = [await fetch_range(client, msg.document, o, length) for o in offs]
+    rf.seek(0)
+    samples = []
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp) / f"x.{it['ext']}"
-        with open(path, "wb") as fh:
-            if it["ext"] == "flac":
-                rf.seek(0)
-                fh.write(await asyncio.to_thread(rf.read, start))  # metadata, then mid-file frames (decoder resyncs)
-                fh.write(chunk)
-                seek = []
-            else:  # sparse file: real headers + middle chunk at their true offsets, then seek into the chunk
-                rf.seek(0)
+        if it["ext"] == "flac":  # metadata + slice; the decoder resyncs on the next frame
+            head = await asyncio.to_thread(rf.read, start)
+            for i, chunk in enumerate(chunks):
+                path = Path(tmp) / f"{i}.flac"
+                path.write_bytes(head + chunk)
+                samples.append(await decode(path, 0, secs))
+        else:  # sparse file: real headers + slices at their true offsets (no real disk use), seek into each slice
+            path = Path(tmp) / f"x.{it['ext']}"
+            with open(path, "wb") as fh:
                 fh.write(await asyncio.to_thread(rf.read, start + 65536))
                 for off, n in extra:
                     fh.seek(off)
                     fh.write(await fetch_range(client, msg.document, off, n))
-                fh.seek(mid)
-                fh.write(chunk)
+                for o, chunk in zip(offs, chunks):
+                    fh.seek(o)
+                    fh.write(chunk)
                 fh.truncate(msg.document.size)
-                dur = info.get("length") or it["duration"]
-                t = dur * ((mid - start) + length * 0.2) / (end - start)
-                seek = ["-ss", f"{t:.2f}"]
-        proc = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-hide_banner", *seek, "-i", str(path), "-t", "6", "-f", "s32le", "-",
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        pcm, log = await proc.communicate()
-    # channel count from ffmpeg's stream line; never downmix (mixing would fake low bits)
-    m = re.search(r"Audio: .*?, \d+ Hz, (mono|stereo|(\d+) channels|(\d)\.(\d))", log.decode(errors="ignore"))
-    channels = 2 if not m else 1 if m[1] == "mono" else 2 if m[1] == "stereo" else int(m[2]) if m[2] else int(m[3]) + int(m[4])
-    res = await asyncio.to_thread(spectrum_verdict, pcm, channels, info["sample_rate"], info.get("bits") or 16)
+            for o in offs:
+                samples.append(await decode(path, dur * ((o - start) + length * 0.1) / (end - start), secs))
+    res = await asyncio.to_thread(spectrum_verdict, samples, info["sample_rate"], info.get("bits") or 16)
     if res:
-        res["fetched_mb"] = round((length + rf.fetched) / 1e6, 1)
+        res["fetched_mb"] = round((length * len(offs) + rf.fetched) / 1e6, 2)
+        await save_spectrogram(samples, info["sample_rate"], it["doc_id"])
     return res
 
 
+class LocalFile(io.FileIO):
+    def __init__(self, path):
+        super().__init__(path)
+        self.size = os.path.getsize(path)
+
+
+async def verify_local(db, path, it):
+    """Downloaded file: probe + verify from disk, zero network. Cached like remote results."""
+    try:
+        with LocalFile(path) as f:
+            info = await asyncio.to_thread(probe, f, it["ext"])
+        if info:
+            db.execute("INSERT OR REPLACE INTO probes VALUES(?,?,?,?)",
+                       (it["doc_id"], json.dumps(info), PROBE_VERSION, int(time.time())))
+        res = None
+        if info and info.get("sample_rate") and it.get("lossless"):
+            dur = info.get("length") or it["duration"]
+            samples = [await decode(path, dur * p) for p in SAMPLE_POINTS]
+            res = await asyncio.to_thread(spectrum_verdict, samples, info["sample_rate"], info.get("bits") or 16)
+            if res:
+                res["fetched_mb"] = 0
+                await save_spectrogram(samples, info["sample_rate"], it["doc_id"])
+            db.execute("INSERT OR REPLACE INTO verify VALUES(?,?,?,?)",
+                       (it["doc_id"], json.dumps(res) if res else None, VERIFY_VERSION, int(time.time())))
+        db.commit()
+        return res
+    except Exception as e:
+        err.print(f"[yellow]local verify failed[/] {path}: {e}")
+
+
 async def verify_items(client, db, items):
-    """Spectrum-verify lossless items never verified before; cache every result (even failures)."""
+    """Spectrum-verify lossless items never verified (with current code) before; cache every result."""
     if client is None:
         return
     done = {r["doc_id"] for r in db.execute("SELECT doc_id FROM verify WHERE version>=?", (VERIFY_VERSION,))}
@@ -767,16 +840,16 @@ async def verify_items(client, db, items):
     msgs = await fetch_messages(client, db, [it["ref"] for it in need.values()])
     infos = {r["doc_id"]: json.loads(r["info"]) for r in db.execute("SELECT doc_id, info FROM probes WHERE info IS NOT NULL")}
     sem = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
-    count = 0
+    count, mb = 0, 0.0
 
     async def one(it):
-        nonlocal count
+        nonlocal count, mb
         msg = msgs.get(it["ref"])
         if not msg:
             return
         async with sem:
             try:
-                res = await verify_one(client, db, msg, it, infos.get(it["doc_id"]))
+                res = await verify_one(client, msg, it, infos.get(it["doc_id"]))
             except Exception as e:
                 err.print(f"[yellow]verify failed[/] {it['ref']}: {e}")
                 res = None
@@ -784,10 +857,12 @@ async def verify_items(client, db, items):
                    (it["doc_id"], json.dumps(res) if res else None, VERIFY_VERSION, int(time.time())))
         db.commit()
         count += 1
-        status.update(f"Spectrum check {count}/{len(need)} (~4 MB each)…")
+        mb += (res or {}).get("fetched_mb", 0)
+        status.update(f"Spectrum check {count}/{len(need)} ({mb:.1f} MB fetched)…")
 
-    with err.status(f"Spectrum check 0/{len(need)} (~4 MB each)…") as status:
+    with err.status(f"Spectrum check 0/{len(need)}…") as status:
         await asyncio.gather(*(one(it) for it in need.values()))
+    err.print(f"Spectrum checked {count} files, {mb:.1f} MB fetched · spectrograms in {SPECTRO_DIR}")
 
 
 async def verify_best(client, db, items, groups_fn, rounds=3):
@@ -975,7 +1050,9 @@ async def download_items(client, db, picks):
                    (it["doc_id"], str(final), key, it.get("score"), int(time.time())))
         db.commit()
         done += 1
-        err.print(f"[green]Saved[/] ({done}/{len(todo)}) {final}")
+        res = await verify_local(db, final, it) if it.get("lossless") and shutil.which("ffmpeg") else None
+        note = f" · {res['verdict']}" if res else ""
+        err.print(f"[green]Saved[/] ({done}/{len(todo)}) {final}{note}")
 
     await asyncio.gather(*(one(*t) for t in todo))
 
@@ -1158,8 +1235,9 @@ async def cmd_search(client, db, args):
             items = match(load_items(db, args.chat), args.queries)
     items = await ensure_probed(client, db, items) if not args.no_probe else apply_probes(db, items)
     groups = group(items)[:args.limit]
-    if args.verify:
-        groups = (await verify_best(client, db, [i for g in groups for i in g], group))[:args.limit]
+    if args.verify:  # only the top 10 song groups (each check fetches ~0.5-4 MB)
+        top = await verify_best(client, db, [i for g in groups[:10] for i in g], group)
+        groups = (top + groups[10:])[:args.limit]
     if args.json:
         print(json.dumps([{"song": g[0]["norm"], "duration": g[0]["duration"], "copies": [public(i) for i in g]}
                           for g in groups], ensure_ascii=False, indent=1))
