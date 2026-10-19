@@ -39,6 +39,13 @@ $ python hifigram.py search "song title" --verify
   5.1 surround and `--min-length` skips intros.
 - **Bulk artist downloads**: a plan picks the best copy of every unique song by an artist. Review it, then download. It
   can resume, and it skips anything you already have.
+- **Albums**: `albums "name or artist"` finds albums with track count, missing tracks and best quality. `album "A" "B"`
+  plans several albums at once and downloads them as numbered files. Albums are inferred from file tags (read during
+  the header check, cover art skipped), `(From "Movie")` titles, captions, Telegram album posts and numbered runs of
+  tracks. Film songs scattered across compilations and singles are collected too.
+- **Categories and filters**: `--format flac,wav,dsf`, `--lang tamil`, `--version instrumental`, `--no-version karaoke`,
+  `--length song`, plus `--genre` and `--decade` from file tags. `stats --categories` shows the breakdown.
+- **DSD** (`.dsf`) is recognised and labelled `DSD64/128/256`.
 - **Never fetches anything twice.** Scans are checkpointed and resumable. Later syncs fetch only new posts, and unchanged
   chats cost zero API calls. Header checks, verify results and downloads are cached per file, so a file reposted in
   ten channels is checked once.
@@ -75,6 +82,11 @@ python hifigram.py top 5 "artist" --chat "lossless"      # within a search and c
 python hifigram.py get -1001234567890:4242               # download (refs come from search output)
 python hifigram.py artist "Artist Name" "alt spelling" --plan --verify   # best copy of every song -> plans/
 python hifigram.py artist "Artist Name" --download                       # download the plan
+python hifigram.py albums "movie or artist"             # albums: songs found, missing tracks, best quality
+python hifigram.py album "Album A" "Album B|alt" --plan --verify --stereo  # one plan per album -> plans/album-*.json
+python hifigram.py album "Album A" "Album B" --download  # numbered files in downloads/<Album>/
+python hifigram.py search "song" --lang tamil --format flac --no-version karaoke   # filters
+python hifigram.py stats --categories                    # formats, languages, versions, genres, decades, albums
 python hifigram.py channels "flac"                       # find public channels by name
 python hifigram.py scan @somechannel                     # index one without joining
 python hifigram.py stats                                 # what's in the index

@@ -37,6 +37,16 @@ asks for the code Telegram sends). Never try to log in for them. Never print, co
 - `--stereo`: skip surround (labels show `5.1` / `mono`). Use it for "best quality" unless they want surround.
 - `HG artist "Canonical Name" "variant" --plan [--verify] [--stereo] --json` → `<repo>/plans/<slug>.json`;
   `HG artist "Canonical Name" --download` downloads the saved plan (resumable).
+- `HG albums "movie/album or artist" --json`: albums with songs found, missing track numbers, best quality, size.
+  Unnamed runs in the results get named from one track's tags (~130 KB each, cached).
+- `HG album "A" "B|alt spelling" --plan [--verify] [--stereo] --json`: one plan per album
+  (`plans/album-<slug>.json`, entries ordered by track, `missing_tracks`). Also collects film songs posted as singles
+  or inside compilations ("(From X)"). `HG album "A" "B" --download` → `downloads/<Album>/NN - Title.ext`.
+  Use `--artist` to tell apart albums with common names.
+- Filters on search/top/artist/albums/album: `--format flac,wav,alac,dsf`, `--lang tamil|telugu|hindi|japanese|...`
+  (script, else the channel name), `--version instrumental,remix,live,...`, `--no-version karaoke`,
+  `--length short|song|long|mix`, `--genre X` and `--decade 1990s` (file tags; only header-checked files have them).
+  `HG stats --categories` for the breakdown.
 - `HG channels "name" --json`: public channels by name. `HG scan @username`: index one without joining. Only scan
   channels the user picked.
 
@@ -48,6 +58,13 @@ asks for the code Telegram sends). Never try to log in for them. Never print, co
 2. `HG search ... --json`. Show a short ranked list (song, best label, size, channel) and recommend one. Add
    `--verify` when they care about quality.
 3. Download on their pick: `HG get <ref>`. Mention the size first if it's large.
+
+## Albums
+
+1. `HG albums "name" --json` and pick the right one (check artist and channel; common names collide).
+2. `HG album "Name" ["Other album"] --plan --verify --stereo --json`. Review `missing_tracks`, flags and odd entries
+   (set `"skip": true`). Tell the user songs, lossless count, size and missing tracks. **Ask before downloading.**
+3. `HG album "Name" ["Other album"] --download`.
 
 ## All songs by an artist
 

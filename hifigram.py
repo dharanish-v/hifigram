@@ -7,9 +7,15 @@ Usage:
   hifigram.py stats                             what's in the index
   hifigram.py search "q1" "q2" [--json]         fuzzy search the index, grouped by song, best copy first
   hifigram.py top 5 ["query"] [--chat NAME]     highest-quality unique songs
-  hifigram.py verify CHAT:MSG ...               spectrum check for fake lossless (~4 MB each); also --verify on search/top/artist
+  hifigram.py verify CHAT:MSG ...               spectrum check for fake lossless (~1-5 MB each); also --verify on search/top/artist
   hifigram.py channels "tamil flac"             find public channels by name (nothing joined)
   hifigram.py scan @channel                     index a public channel without joining
+  hifigram.py albums "name or artist"          find albums: songs found, missing tracks, best quality
+  hifigram.py album "A" "B|alt" --plan          best copy of every track of each album -> plans/album-*.json
+  hifigram.py album "A" "B" --download          download those albums (resumable, numbered files)
+  hifigram.py stats --categories               formats, languages, lengths, versions, genres, decades, albums
+  filters (search/top/artist/albums/album): --format flac,wav --lang tamil --version instrumental --no-version karaoke
+                                             --length song --genre rock --decade 1990s
   hifigram.py get CHAT:MSG [CHAT:MSG ...]       download specific files
   hifigram.py artist "name" "variant" --plan    best copy of every unique song -> plans/<artist>.json
   hifigram.py artist "name" --download          download that plan (resumable, skips what you have)
@@ -50,7 +56,7 @@ DOWNLOADS = HERE / "downloads"
 PLANS = HERE / "plans"
 DB = HERE / "index.db"
 
-LOSSLESS = {"flac", "alac", "wav", "aiff", "aif", "ape", "wv"}
+LOSSLESS = {"flac", "alac", "wav", "aiff", "aif", "ape", "wv", "dsf", "dff"}
 AUDIO_EXTS = LOSSLESS | {"mp3", "m4a", "aac", "ogg", "opus", "oga", "wma"}
 # rough perceptual weight vs MP3 at the same bitrate
 CODEC_WEIGHT = {"mp3": 1.0, "aac": 1.25, "m4a": 1.25, "opus": 1.6, "ogg": 1.2, "oga": 1.2, "wma": 0.9}
@@ -155,10 +161,122 @@ class RemoteFile:
         return True
 
 
+TAG_KEYS = {  # tag name in file -> our key
+    "ALBUM": "album", "TALB": "album", b"\xa9alb": "album",
+    "ALBUMARTIST": "albumartist", "ALBUM ARTIST": "albumartist", "TPE2": "albumartist", b"aART": "albumartist",
+    "ARTIST": "artist", "TPE1": "artist", b"\xa9ART": "artist",
+    "TRACKNUMBER": "track", "TRCK": "track", b"trkn": "track",
+    "TRACKTOTAL": "tracks", "TOTALTRACKS": "tracks",
+    "DISCNUMBER": "disc", "TPOS": "disc", b"disk": "disc",
+    "GENRE": "genre", "TCON": "genre", b"\xa9gen": "genre",
+    "DATE": "year", "YEAR": "year", "TDRC": "year", "TYER": "year", b"\xa9day": "year",
+}
+
+
+def clean_tags(t):
+    """Normalise raw tag values: '3/12' -> track 3, tracks 12; '2019-05-01' -> year 2019."""
+    out = {}
+    for k, v in t.items():
+        v = str(v).strip().strip("\x00").strip()
+        if not v:
+            continue
+        if k in ("track", "disc"):
+            num, _, total = v.partition("/")
+            if num.strip().isdigit():
+                out[k] = int(num)
+            if k == "track" and total.strip().isdigit():
+                out["tracks"] = int(total)
+        elif k == "tracks":
+            if v.isdigit():
+                out[k] = int(v)
+        elif k == "year":
+            m = re.search(r"(19|20)\d\d", v)
+            if m:
+                out[k] = int(m[0])
+        elif k == "genre":
+            out[k] = re.sub(r"^\((\d+)\)", "", v).strip() or v
+        else:
+            out[k] = v[:200]
+    return out
+
+
+def vorbis_comments(data):
+    t = {}
+    try:
+        n = int.from_bytes(data[:4], "little")
+        pos = 4 + n
+        count = int.from_bytes(data[pos:pos + 4], "little")
+        pos += 4
+        for _ in range(min(count, 500)):
+            ln = int.from_bytes(data[pos:pos + 4], "little")
+            k, _, v = data[pos + 4:pos + 4 + ln].decode("utf-8", "replace").partition("=")
+            pos += 4 + ln
+            if TAG_KEYS.get(k.upper()):
+                t.setdefault(TAG_KEYS[k.upper()], v)
+    except Exception:
+        pass
+    return clean_tags(t)
+
+
+def id3_text(data):
+    enc, raw = data[0], data[1:]
+    codec = {0: "latin-1", 1: "utf-16", 2: "utf-16-be", 3: "utf-8"}.get(enc, "latin-1")
+    return raw.decode(codec, "replace").split("\x00")[0]
+
+
+def id3_tags(f, tag_size, version):
+    """Read ID3v2.3/2.4 text frames up to the first picture (cover art is never fetched)."""
+    t, pos, end = {}, 10, 10 + tag_size
+    while pos + 10 <= end and version in (3, 4):
+        f.seek(pos)
+        h = f.read(10)
+        fid = h[:4].decode("latin-1", "replace")
+        if not fid.strip("\x00") or fid == "APIC":
+            break
+        size = int.from_bytes(h[4:8], "big") if version == 3 else (
+            (h[4] << 21) | (h[5] << 14) | (h[6] << 7) | h[7])
+        if fid in TAG_KEYS and 0 < size < 4096:
+            t.setdefault(TAG_KEYS[fid], id3_text(f.read(size)))
+        pos += 10 + size
+    return clean_tags(t)
+
+
+def mp4_tags(f, moov):
+    udta = mp4_child(f, *moov, b"udta")
+    meta = mp4_child(f, *udta, b"meta") if udta else None
+    ilst = mp4_child(f, meta[0] + 4, meta[1], b"ilst") if meta else None  # meta is a full box
+    t = {}
+    for typ, s, e in (mp4_atoms(f, *ilst) if ilst else ()):
+        key = TAG_KEYS.get(typ)
+        if not key or e - s > 4096:
+            continue  # covr (cover art) is never read
+        data = mp4_child(f, s, e, b"data")
+        if not data:
+            continue
+        f.seek(data[0] + 8)  # type + locale
+        v = f.read(data[1] - data[0] - 8)
+        if typ in (b"trkn", b"disk"):
+            t[key] = f"{int.from_bytes(v[2:4], 'big')}/{int.from_bytes(v[4:6], 'big')}"
+        else:
+            t[key] = v.decode("utf-8", "replace")
+    return clean_tags(t)
+
+
+def probe_dsf(f):
+    h = f.read(28 + 52)
+    if h[:4] != b"DSD " or h[28:32] != b"fmt ":
+        return None
+    le = lambda a, b: int.from_bytes(h[a:b], "little")
+    ch, sr, bits, samples = le(52, 56), le(56, 60), le(60, 64), le(64, 72)
+    length = samples / sr if sr else 0
+    return {"dsd": True, "sample_rate": sr, "bits": bits, "channels": ch, "length": length,
+            "kbps": round(sr * ch / 1000)}
+
+
 def probe_flac(f):
     if f.read(4) != b"fLaC":
         return None
-    info, pos = None, 4
+    info, pos, tags = None, 4, {}
     for _ in range(128):
         hdr = f.read(4)
         if len(hdr) < 4:
@@ -168,6 +286,8 @@ def probe_flac(f):
             x = int.from_bytes(f.read(length)[10:18], "big")
             sr, bits, total = x >> 44, ((x >> 36) & 0x1F) + 1, x & 0xFFFFFFFFF
             info = {"sample_rate": sr, "bits": bits, "length": total / sr if sr else 0, "channels": ((x >> 41) & 7) + 1}
+        elif btype == 4 and length < 256 * 1024:  # VORBIS_COMMENT: album, track, genre, year (pictures skipped)
+            tags = vorbis_comments(f.read(length))
         else:
             f.seek(length, 1)
         pos += 4 + length
@@ -175,18 +295,21 @@ def probe_flac(f):
             break
     if info and info["length"]:
         info["kbps"] = round((f.size - pos) * 8 / info["length"] / 1000)  # audio only, no cover art
+    if info:
+        info["tags"] = tags
     return info
 
 
 def probe_mp3(f):
     h = f.read(10)
-    offset = 0
+    offset, tags = 0, {}
     if h[:3] == b"ID3":
         size = (h[6] << 21) | (h[7] << 14) | (h[8] << 7) | h[9]
-        offset = 10 + size + (10 if h[5] & 0x10 else 0)  # skip tag (cover art) without reading it
+        tags = id3_tags(f, size, h[3]) if not h[5] & 0x40 else {}
+        offset = 10 + size + (10 if h[5] & 0x10 else 0)  # skip the rest of the tag (cover art) without reading it
     info = MPEGInfo(f, offset)
     return {"kbps": round(info.bitrate / 1000), "sample_rate": info.sample_rate, "length": info.length,
-            "vbr": info.bitrate_mode in (BitrateMode.VBR, BitrateMode.ABR), "channels": info.channels}
+            "vbr": info.bitrate_mode in (BitrateMode.VBR, BitrateMode.ABR), "channels": info.channels, "tags": tags}
 
 
 def mp4_atoms(f, start, end):
@@ -248,7 +371,7 @@ def probe_mp4(f):
         mdat = top.get(b"mdat")
         kbps = round((mdat[1] - mdat[0]) * 8 / length / 1000) if mdat and length else 0
         return {"kbps": kbps, "sample_rate": sr, "bits": bits, "length": length, "alac": fmt == b"alac",
-                "channels": channels}
+                "channels": channels, "tags": mp4_tags(f, top[b"moov"])}
     return None
 
 
@@ -317,6 +440,8 @@ def probe(f, ext):
         return probe_mp3(f)
     head = f.read(12)
     f.seek(0)
+    if head[:4] == b"DSD ":
+        return probe_dsf(f)
     if head[4:8] == b"ftyp":
         return probe_mp4(f)
     if head[:4] == b"RIFF":
@@ -351,7 +476,7 @@ CREATE TABLE IF NOT EXISTS remote_queries(kind TEXT, q TEXT, at INTEGER, hits IN
 CREATE TABLE IF NOT EXISTS verify(doc_id INTEGER PRIMARY KEY, result TEXT, version INTEGER, at INTEGER);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
-PROBE_VERSION = 2  # bump when probe code improves: failed probes from older versions get retried
+PROBE_VERSION = 3  # bump when probe code improves: failed probes from older versions get retried
 FILTERS = {"music": InputMessagesFilterMusic, "files": InputMessagesFilterDocument}
 
 
@@ -363,14 +488,30 @@ def open_db():
     except sqlite3.OperationalError:
         pass
     db.executescript(SCHEMA)
+    try:  # added later: Telegram album/media-group id of each post
+        db.execute("ALTER TABLE files ADD COLUMN grouped_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
     return db
+
+
+MIME_EXT = {"flac": "flac", "x-flac": "flac", "mpeg": "mp3", "mp3": "mp3", "mp4": "m4a", "m4a": "m4a", "x-m4a": "m4a",
+            "aac": "aac", "wav": "wav", "x-wav": "wav", "vnd.wave": "wav", "ogg": "ogg", "opus": "opus",
+            "x-dsf": "dsf", "dsf": "dsf", "x-dff": "dff", "x-ape": "ape", "x-wavpack": "wv", "aiff": "aiff", "x-aiff": "aiff"}
+
+
+def clean_ext(ext, mime):
+    """File-name extension if it looks like one, else derived from the MIME type ("Song (From X.)" has no ext)."""
+    ext = (ext or "").lower().lstrip(".")
+    if ext in AUDIO_EXTS or ext in MIME_EXT.values():
+        return ext
+    return MIME_EXT.get((mime or "").split("/")[-1].lower(), ext if re.fullmatch(r"[a-z0-9]{2,4}", ext) else "")
 
 
 def ext_of(msg):
     name = msg.file.name or ""
-    ext = name.rsplit(".", 1)[-1].lower() if "." in name else (
-        (msg.file.ext or "").lstrip(".").lower() or (msg.file.mime_type or "").split("/")[-1])
-    return "flac" if ext == "x-flac" else ext
+    ext = name.rsplit(".", 1)[-1] if "." in name else (msg.file.ext or "")
+    return clean_ext(ext, msg.file.mime_type)
 
 
 def is_audio(msg):
@@ -408,10 +549,11 @@ def remember(db, msgs):
         audio = next((a for a in doc.attributes if isinstance(a, DocumentAttributeAudio)), None)
         if msg.chat:
             remember_chat(db, msg.chat_id, msg.chat)
-        db.execute("INSERT OR REPLACE INTO files VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (
+        db.execute("INSERT OR REPLACE INTO files(chat_id, msg_id, doc_id, size, duration, mime, ext, title, performer, "
+                   "file_name, caption, date, grouped_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (
             msg.chat_id, msg.id, doc.id, doc.size, (audio.duration if audio else 0) or 0, doc.mime_type or "",
             ext_of(msg), (audio.title if audio else None) or "", (audio.performer if audio else None) or "",
-            msg.file.name or "", msg.message or "", int(msg.date.timestamp()) if msg.date else 0))
+            msg.file.name or "", msg.message or "", int(msg.date.timestamp()) if msg.date else 0, msg.grouped_id))
         n += 1
     return n
 
@@ -429,7 +571,8 @@ def item_from_row(r):
     return {
         "ref": f"{r['chat_id']}:{r['msg_id']}", "doc_id": r["doc_id"], "chat": r["chat_title"] or "?", "link": link,
         "title": r["title"], "performer": r["performer"], "file_name": r["file_name"], "caption": r["caption"][:300],
-        "duration": r["duration"], "size": r["size"], "mime": r["mime"], "ext": r["ext"], "probed": False,
+        "duration": r["duration"], "size": r["size"], "mime": r["mime"], "ext": clean_ext(r["ext"], r["mime"]), "probed": False,
+        "msg_id": r["msg_id"], "chat_id": r["chat_id"], "grouped_id": r["grouped_id"],
     }
 
 
@@ -555,7 +698,13 @@ def assess(item, info, ver=None):
     kbps = (info or {}).get("kbps") or (round(size * 8 / dur / 1000) if dur else 0)
     lossless = ext in LOSSLESS or bool((info or {}).get("alac"))
     item["kbps"], item["lossless"] = kbps, lossless
-    if lossless:
+    item["tags"] = (info or {}).get("tags") or {}
+    if lossless and (info or {}).get("dsd"):  # DSD64 = 2.8224 MHz 1-bit; ranked like the PCM rate it resolves
+        sr = info["sample_rate"]
+        item["label"] = f"DSD{round(sr / 44100)}"
+        item["score"] = 10000 + 24 * 100 + sr / 32 / 1000
+        item["tier"] = "hires"
+    elif lossless:
         fmt = "ALAC" if (info or {}).get("alac") else ext.upper()
         bits, sr = (info or {}).get("bits") or 0, (info or {}).get("sample_rate") or 0
         if bits and sr:
@@ -597,25 +746,28 @@ def stereo_only(items):
     return [it for it in items if (it.get("channels") or 2) <= 2]
 
 
-async def ensure_probed(client, db, items, need_channels=False):
+async def ensure_probed(client, db, items, need=()):
     """Header-probe only documents never probed before (or failed with older probe code); cache every result.
-    need_channels: also re-read the header of older probes that lack the channel count (--stereo)."""
+    need: info keys (e.g. "channels", "tags") that older probes may lack; only those headers are re-read."""
     if client is None:  # --offline: cached results only
         return apply_probes(db, items)
     have = {r["doc_id"]: r for r in db.execute("SELECT doc_id, info, version FROM probes")}
     vers = {r["doc_id"]: r["result"] for r in db.execute("SELECT doc_id, result FROM verify")}
-    need = {}
+    todo = {}
     for it in items:
         row = have.get(it["doc_id"])
-        if row and need_channels and row["info"] and "channels" not in json.loads(row["info"]):
-            if not json.loads(vers.get(it["doc_id"]) or "{}").get("channels"):
-                need.setdefault(it["doc_id"], it)
+        if row and need and row["info"]:
+            info = json.loads(row["info"])
+            missing = [k for k in need if k not in info and not (k == "channels" and
+                                                                  json.loads(vers.get(it["doc_id"]) or "{}").get(k))]
+            if missing:
+                todo.setdefault(it["doc_id"], it)
             continue
         if row and (row["info"] or row["version"] >= PROBE_VERSION):
             continue
-        need.setdefault(it["doc_id"], it)
-    if need:
-        msgs = await fetch_messages(client, db, [it["ref"] for it in need.values()])
+        todo.setdefault(it["doc_id"], it)
+    if todo:
+        msgs = await fetch_messages(client, db, [it["ref"] for it in todo.values()])
         loop = asyncio.get_running_loop()
         sem = asyncio.Semaphore(PROBE_CONCURRENCY)
         done = 0
@@ -638,10 +790,10 @@ async def ensure_probed(client, db, items, need_channels=False):
                        (it["doc_id"], json.dumps(info) if info else None, PROBE_VERSION, int(time.time())))
             db.commit()
             done += 1
-            status.update(f"Checking real quality {done}/{len(need)} (new files only)…")
+            status.update(f"Checking real quality {done}/{len(todo)} (new files only)…")
 
-        with err.status(f"Checking real quality 0/{len(need)} (new files only)…") as status:
-            await asyncio.gather(*(one(it) for it in need.values()))
+        with err.status(f"Checking real quality 0/{len(todo)} (new files only)…") as status:
+            await asyncio.gather(*(one(it) for it in todo.values()))
     return apply_probes(db, items)
 
 
@@ -865,7 +1017,7 @@ async def verify_items(client, db, items):
     done = {r["doc_id"] for r in db.execute("SELECT doc_id FROM verify WHERE version>=?", (VERIFY_VERSION,))}
     need = {}
     for it in items:
-        if it["lossless"] and it["doc_id"] not in done:
+        if it["lossless"] and it["ext"] not in ("dsf", "dff") and it["doc_id"] not in done:  # DSD: no PCM spectrum test
             need.setdefault(it["doc_id"], it)
     if not need:
         return
@@ -949,7 +1101,7 @@ def match(items, queries, min_score=80):
                 if w in toks or any(t.startswith(w) for t in toks):
                     scores.append(100)
                     continue
-                m = process.extractOne(w, toks, scorer=fuzz.ratio, score_cutoff=min_score) if len(w) > 3 else None
+                m = process.extractOne(w, toks, scorer=fuzz.ratio, score_cutoff=min_score) if len(w) > 3 and min_score <= 100 else None
                 if not m:
                     break
                 scores.append(m[1])
@@ -1019,6 +1171,9 @@ def safe_name(s):
 
 
 def file_name_for(it):
+    if it.get("name_prefix"):  # album: "03 - Title.flac"
+        base = it["title"] or re.sub(r"^\s*\d{1,3}\s*[-._)]\s*", "", Path(it["file_name"]).stem) or it.get("norm") or "audio"
+        return f"{safe_name(it['name_prefix'] + unicodedata.normalize('NFKC', base))}.{it['ext'] or 'bin'}"
     base = " - ".join(filter(None, [it["performer"], it["title"]])) or Path(it["file_name"]).stem or it.get("norm") or "audio"
     return f"{safe_name(unicodedata.normalize('NFKC', base))}.{it['ext'] or 'bin'}"
 
@@ -1094,7 +1249,227 @@ async def download_items(client, db, picks):
     await asyncio.gather(*(one(*t) for t in todo))
 
 
-# ---------- artist plans ----------
+# ---------- categories / filters ----------
+
+LANGS = ("tamil", "telugu", "hindi", "malayalam", "kannada", "bengali", "punjabi", "marathi", "english", "japanese",
+         "korean", "chinese", "russian", "arabic", "spanish", "french", "german")
+SCRIPTS = (("tamil", 0x0B80, 0x0BFF), ("telugu", 0x0C00, 0x0C7F), ("kannada", 0x0C80, 0x0CFF),
+           ("malayalam", 0x0D00, 0x0D7F), ("hindi", 0x0900, 0x097F), ("bengali", 0x0980, 0x09FF),
+           ("japanese", 0x3040, 0x30FF), ("chinese", 0x4E00, 0x9FFF), ("korean", 0xAC00, 0xD7AF),
+           ("russian", 0x0400, 0x04FF), ("arabic", 0x0600, 0x06FF))
+VERSIONS = ("remix", "live", "instrumental", "karaoke", "acoustic", "cover", "unplugged", "lofi", "slowed", "reprise",
+            "ost", "bgm", "theme", "atmos", "remaster")
+
+
+def lang_of(it):
+    """Script of title/artist (Indic, CJK, Cyrillic...), else a language named in the channel title."""
+    counts = {}
+    for ch in unicodedata.normalize("NFKC", f"{it['title']} {it['performer']} {it['file_name']}"):
+        o = ord(ch)
+        for name, a, b in SCRIPTS:
+            if a <= o <= b:
+                counts[name] = counts.get(name, 0) + 1
+    if counts:
+        return max(counts, key=counts.get)
+    chat = it["chat"].lower()
+    return next((lang for lang in LANGS if lang in chat), "")
+
+
+def versions_of(it):
+    hay = norm_text(" ".join([it["title"], it["file_name"]]))
+    return [v for v in VERSIONS if re.search(rf"\b{v}\b", hay)]
+
+
+def length_bucket(d):
+    return "short" if d < 60 else "song" if d < 360 else "long" if d < 900 else "mix"
+
+
+def needs(args):
+    keys = ("channels",) if getattr(args, "stereo", False) else ()
+    if getattr(args, "genre", None) or getattr(args, "decade", None):
+        keys += ("tags",)
+    return keys
+
+
+def filter_items(items, args):
+    """--format/--lang/--version/--length work on the index; --genre/--decade need file tags (read on probe)."""
+    if getattr(args, "format", None):
+        fmts = {f.strip().lower() for f in args.format.split(",")}
+        items = [it for it in items if it["ext"] in fmts or (it["ext"] == "m4a" and "alac" in fmts and it.get("label", "").startswith("ALAC"))]
+    if getattr(args, "lang", None):
+        items = [it for it in items if lang_of(it) == args.lang.lower()]
+    if getattr(args, "version", None):
+        want = {v.strip().lower() for v in args.version.split(",")}
+        items = [it for it in items if want & set(versions_of(it))]
+    if getattr(args, "no_version", None):
+        drop = {v.strip().lower() for v in args.no_version.split(",")}
+        items = [it for it in items if not drop & set(versions_of(it))]
+    if getattr(args, "length", None):
+        items = [it for it in items if length_bucket(it["duration"]) == args.length]
+    return items
+
+
+def filter_tags(items, args):
+    if getattr(args, "genre", None):
+        g = args.genre.lower()
+        items = [it for it in items if g in (it.get("tags") or {}).get("genre", "").lower()]
+    if getattr(args, "decade", None):
+        d = int(re.sub(r"\D", "", args.decade)[:4])
+        items = [it for it in items if d <= (it.get("tags") or {}).get("year", 0) < d + 10]
+    return items
+
+
+def add_filter_args(sp):
+    sp.add_argument("--format", help="comma list: flac,wav,alac,dsf,mp3,...")
+    sp.add_argument("--lang", help="tamil, telugu, hindi, japanese, russian, ... (script or channel name)")
+    sp.add_argument("--version", help="only these versions: instrumental,remix,live,karaoke,acoustic,ost,...")
+    sp.add_argument("--no-version", help="exclude these versions, e.g. karaoke,remix")
+    sp.add_argument("--length", choices=("short", "song", "long", "mix"), help="<1 min, 1-6, 6-15, >15 min")
+    sp.add_argument("--genre", help="from file tags (read on header check)")
+    sp.add_argument("--decade", help="e.g. 1990s, from file tags")
+
+
+# ---------- albums ----------
+# A post has no album field, so albums are inferred, strongest signal first:
+#   1. ALBUM tag inside the file (read during the header check, cover art skipped)
+#   2. "(From "Movie")" in title/file name, or "Album:/Movie:" in the caption
+#   3. Telegram media groups (posted together) and runs of consecutive numbered tracks in one chat
+
+FROM_RE = re.compile(r"""\(\s*from\s*[_"'“”‘’]*\s*([^)"'“”_]+?)\s*[_"'“”‘’]*\s*\)""", re.I)
+CAPTION_ALBUM_RE = re.compile(r"^\s*(?:album|movie|film|ost)\s*[:\-–]\s*(.+?)\s*$", re.I | re.M)
+TRACKNO_RE = re.compile(r"^\s*(?:\d-)?(\d{1,3})\s*[-._)\s]")
+
+
+EDITION_RE = re.compile(r"[\(\[][^\)\]]*(soundtrack|o\.?s\.?t|motion picture|deluxe|edition|remaster|expanded|"
+                        r"anniversary|bonus|version|hi-?res|24.?bit|flac)[^\)\]]*[\)\]]", re.I)
+
+
+def album_norm(name):
+    """'Baththa (Original Motion Picture Soundtrack)' == 'Baththa' == 'BATHTHA [Deluxe Edition]'"""
+    return norm_text(EDITION_RE.sub(" ", name or ""))
+
+
+def track_no(it):
+    t = (it.get("tags") or {}).get("track")
+    if t:
+        return t
+    m = TRACKNO_RE.match(it["file_name"] or it["title"] or "")
+    return int(m[1]) if m else None
+
+
+def album_hint(it):
+    tag = (it.get("tags") or {}).get("album")
+    if tag:  # 'Magale (From "Baththa") - Single' is a track of Baththa
+        m = FROM_RE.search(tag)
+        tag = m[1] if m else re.sub(r"\s*[-–]\s*(single|ep)\s*$", "", tag, flags=re.I)
+        return tag, "tag"
+    for s in (it["title"], it["file_name"]):
+        m = FROM_RE.search(s or "")
+        if m:
+            return m[1], "from"
+    m = CAPTION_ALBUM_RE.search(it["caption"] or "")
+    return (m[1][:80], "caption") if m else (None, None)
+
+
+def from_hint(it):
+    """Album/movie named in the post itself (title, file name, caption), ignoring the file's own album tag."""
+    for t in (it["title"], it["file_name"]):
+        m = FROM_RE.search(t or "")
+        if m:
+            return m[1]
+    m = CAPTION_ALBUM_RE.search(it["caption"] or "")
+    return m[1] if m else None
+
+
+def album_index(items):
+    """-> {album_key: {"name", "source", "artists": Counter, "items": [...], "chats": set}}"""
+    from collections import Counter
+    runs, cur = [], []
+    for it in sorted(items, key=lambda x: (x["chat_id"], x["msg_id"])):
+        t = track_no(it)
+        if cur:
+            last = cur[-1]
+            same = it["chat_id"] == last["chat_id"] and (
+                (it["grouped_id"] and it["grouped_id"] == last["grouped_id"]) or
+                (it["msg_id"] - last["msg_id"] <= 3 and t is not None and track_no(last) is not None
+                 and t == track_no(last) + 1))
+            if not same:
+                runs.append(cur)
+                cur = []
+        cur.append(it)
+    if cur:
+        runs.append(cur)
+    albums = {}
+    for run in runs:
+        hints = Counter()
+        sources = {}
+        for it in run:
+            name, src = album_hint(it)
+            if name and len(album_norm(name)) > 1:
+                hints[album_norm(name)] += 1
+                sources.setdefault(album_norm(name), (name, src))
+        if hints:
+            key = hints.most_common(1)[0][0]
+            name, src = sources[key]
+        elif len(run) >= 3 and sum(track_no(i) is not None for i in run) >= 3:
+            key, name, src = f"run:{run[0]['ref']}", None, "run"
+        else:
+            continue
+        a = albums.setdefault(key, {"key": key, "name": name, "source": src, "artists": Counter(), "items": [],
+                                    "chats": set()})
+        if (a["source"] == "from" and src == "tag") or (src == a["source"] and len(name or "") < len(a["name"] or "")):
+            a["name"], a["source"] = name, src  # a real tag beats a title hint; shortest spelling wins
+        numbered = sum(track_no(i) is not None for i in run) >= 3
+        for it in run:  # a track number counts only from a real album copy (tagged, or part of a numbered run)
+            tags = it.get("tags") or {}
+            it["album_track"] = tags.get("track") if tags.get("tracks", 0) > 1 or (tags.get("track") and numbered) \
+                else (track_no(it) if numbered else None)
+        a["items"] += run
+        a["chats"].add(run[0]["chat"])
+        for it in run:
+            artist = (it.get("tags") or {}).get("albumartist") or it["performer"]
+            if artist:
+                a["artists"][unicodedata.normalize("NFKC", artist)[:60]] += 1
+    for a in albums.values():
+        if a["name"] is None:
+            top = a["artists"].most_common(1)
+            a["name"] = f"{top[0][0] if top else 'Unknown'} – untitled ({a['items'][0]['chat'][:20]})"
+    return albums
+
+
+def album_summary(a):
+    tracks = sorted({i["album_track"] for i in a["items"] if i.get("album_track")})
+    missing = [n for n in range(1, (max(tracks) if tracks else 0) + 1) if n not in tracks]
+    songs = group(list(a["items"]))
+    best = [g[0] for g in songs]
+    return {"album": a["name"], "source": a["source"], "artist": ", ".join(n for n, _ in a["artists"].most_common(2)),
+            "songs": len(songs), "tracks": len(tracks), "missing": missing[:20], "copies": len(a["items"]),
+            "lossless": sum(b["lossless"] for b in best), "best_labels": sorted({b["label"] for b in best})[:4],
+            "size_mb": round(sum(b["size"] for b in best) / 1e6, 1), "chats": sorted(a["chats"])[:3], "key": a["key"]}
+
+
+def match_albums(albums, names, artist=None):
+    hits = []
+    for a in albums.values():
+        n = album_norm(a["name"])
+        ok = any(fuzz.ratio(album_norm(v), n) >= 88 or album_norm(v) == n or
+                 (len(album_norm(v)) > 3 and re.search(rf"\b{re.escape(album_norm(v))}\b", n)) for v in names)
+        if ok and artist:
+            ok = any(fuzz.partial_ratio(norm_text(artist), norm_text(x)) >= 85 for x in a["artists"])
+        if ok:
+            hits.append(a)
+    return hits
+
+
+async def name_albums(client, db, albums):
+    """Unnamed runs: read the tags of one track each (~130 KB) to learn the album name. Cached forever."""
+    firsts = [a["items"][0] for a in albums if a["source"] == "run"]
+    if firsts and client is not None:
+        await ensure_probed(client, db, firsts, ("tags",))
+        apply_probes(db, [i for a in albums for i in a["items"]])
+
+
+# ---------- plans (artist or album) ----------
 
 def slug(s):
     return re.sub(r"[^\w]+", "-", s.lower()).strip("-")
@@ -1106,38 +1481,56 @@ def artist_matches(it, variants):
     return any(norm_text(v) in hay or norm_text(v).replace(" ", "") in squashed for v in variants)
 
 
-async def build_plan(client, db, variants, verify=False, stereo=False):
-    items = apply_probes(db, match(load_items(db), variants))
+async def plan_from_items(client, db, items, name, variants, kind, verify=False, stereo=False, args=None):
+    """Best copy of every unique song in items -> plans/<kind>-<name>.json (review, then --download)."""
+    need = ("channels",) if stereo else ()
+    apply_probes(db, items)
     # probe only what can change the pick: lossless copies, or lossy copies of songs with no lossless copy
-    groups = group(items, strip=variants)
     to_probe = []
-    for g in groups:
+    strip = variants if kind == "artist" else ()
+    for g in group(items, strip=strip):
         lossless = [it for it in g if it["lossless"]]
         to_probe += lossless or g
-    await ensure_probed(client, db, to_probe, stereo)
+    await ensure_probed(client, db, to_probe, need + (("tags",) if kind == "album" else ()))
     if stereo:
         items = stereo_only(items)
-    groups = group(items, strip=variants)
+    if args is not None:
+        items = filter_tags(items, args)
+    groups = group(items, strip=strip)
     if verify:
-        groups = await verify_best(client, db, items, lambda its: group(its, strip=variants))
+        groups = await verify_best(client, db, items, lambda its: group(its, strip=strip))
     entries = []
     for g in groups:
         best = g[0]
         flags = []
-        if not any(artist_matches(it, variants) for it in g):
+        if kind == "artist" and not any(artist_matches(it, variants) for it in g):
             flags.append("artist-not-in-metadata")
         if not best["lossless"] and best["score"] < 240:
             flags.append("low-quality-only")
-        entries.append({"song": best["norm"], "duration": best["duration"], "best": public(best),
+        from collections import Counter
+        nums = Counter(i.get("album_track") for i in g if i.get("album_track")) if kind == "album" else Counter()
+        track = nums.most_common(1)[0][0] if nums else None
+        entries.append({"song": best["norm"], "track": track, "duration": best["duration"], "best": public(best),
                         "alternatives": [public(it) for it in g[1:6]], "copies": len(g), "flags": flags,
                         "skip": False})
-    plan = {"artist": variants[0], "variants": variants, "songs": len(entries),
+    if kind == "album":
+        entries.sort(key=lambda e: (e["track"] is None, e["track"] or 0))
+    tracks = sorted({e["track"] for e in entries if e["track"]})
+    plan = {"kind": kind, "name": name, "artist": name, "variants": variants, "songs": len(entries),
+            "missing_tracks": [n for n in range(1, (max(tracks) if tracks else 0) + 1) if n not in tracks],
             "total_mb": round(sum(e["best"]["size"] for e in entries) / 1e6, 1),
             "lossless": sum(e["best"]["lossless"] for e in entries), "entries": entries}
     PLANS.mkdir(exist_ok=True)
-    path = PLANS / f"{slug(variants[0])}.json"
+    path = PLANS / f"{'album-' if kind == 'album' else ''}{slug(variants[0])}.json"  # what the user typed
     path.write_text(json.dumps(plan, indent=1, ensure_ascii=False))
     return plan, path
+
+
+async def build_plan(client, db, variants, verify=False, stereo=False, args=None):
+    items = match(load_items(db), variants)
+    if args is not None:
+        items = filter_items(apply_probes(db, items), args)
+    return await plan_from_items(client, db, items, variants[0], variants, "artist", verify, stereo, args)
 
 
 def show_plan(plan, path):
@@ -1150,20 +1543,23 @@ def show_plan(plan, path):
         table.add_row(str(i), f"[{TIER_STYLE[b['tier']]}]{b['label']}[/]", f"{b['size'] / 1e6:.1f}MB", f"{m}:{s:02d}",
                       str(e["copies"]), e["song"], ", ".join(e["flags"]))
     out.print(table)
-    out.print(f"{plan['songs']} unique songs · {plan['lossless']} lossless · {plan['total_mb']} MB → {path}")
+    missing = f" · missing tracks {plan['missing_tracks']}" if plan.get("missing_tracks") else ""
+    out.print(f"{plan['songs']} unique songs · {plan['lossless']} lossless · {plan['total_mb']} MB{missing} → {path}")
 
 
 async def run_plan(client, db, plan):
-    artist_dir = DOWNLOADS / safe_name(plan["artist"].title())
+    name = plan.get("name") or plan["artist"]
+    folder = DOWNLOADS / safe_name(name if plan.get("kind") == "album" else name.title())
     picks = []
     for e in plan["entries"]:
         if e["skip"]:
             continue
-        key = f"{slug(plan['artist'])}|{e['song']}|{round(e['duration'] / 3)}"
+        key = f"{plan.get('kind', 'artist')}:{slug(name)}|{e['song']}|{round(e['duration'] / 3)}"
         have = db.execute("SELECT path, score FROM downloads WHERE song_key=? ORDER BY score DESC", (key,)).fetchone()
         if have and have["score"] is not None and have["score"] >= e["best"]["score"] and Path(have["path"]).exists():
             continue
-        picks.append((e["best"] | {"norm": e["song"]}, artist_dir, key))
+        prefix = f"{e['track']:02d} - " if plan.get("kind") == "album" and e.get("track") else ""
+        picks.append((e["best"] | {"norm": e["song"], "name_prefix": prefix}, folder, key))
     err.print(f"{len(picks)} to download, {len(plan['entries']) - len(picks)} skipped/already have")
     await download_items(client, db, picks)
 
@@ -1272,7 +1668,9 @@ async def cmd_search(client, db, args):
     if (not items or args.remote) and not args.offline:
         if await remote_search(client, db, args.queries, force=args.remote):
             items = match(load_items(db, args.chat), args.queries)
-    items = await ensure_probed(client, db, items, args.stereo) if not args.no_probe else apply_probes(db, items)
+    items = filter_items(apply_probes(db, items), args)
+    items = await ensure_probed(client, db, items, needs(args)) if not args.no_probe else apply_probes(db, items)
+    items = filter_tags(items, args)
     if args.stereo:
         items = stereo_only(items)
     groups = group(items)[:args.limit]
@@ -1292,7 +1690,7 @@ async def cmd_top(client, db, args):
     if args.queries:
         items = match(items, args.queries)
     items = [it for it in items if it["duration"] >= args.min_length]
-    apply_probes(db, items)
+    items = filter_items(apply_probes(db, items), args)
     # shortlist: everything already probed + highest estimated bitrate lossless candidates (true hi-res is far ahead)
     unprobed = sorted((it for it in items if not it["probed"]), key=lambda it: (-it["lossless"], -it["kbps"]))
     shortlist = [it for it in items if it["probed"]]
@@ -1300,9 +1698,10 @@ async def cmd_top(client, db, args):
     while True:  # with --stereo, surround files drop out: widen the shortlist until n songs remain
         shortlist += unprobed[:batch]
         unprobed = unprobed[batch:]
-        shortlist = await ensure_probed(client, db, shortlist, args.stereo)
+        shortlist = await ensure_probed(client, db, shortlist, needs(args))
         if args.stereo:
             shortlist = stereo_only(shortlist)
+        shortlist = filter_tags(shortlist, args)
         if not args.stereo or len(group(shortlist)) >= args.n * 3 or not unprobed or client is None:
             break
     groups = group(shortlist)[:args.n]
@@ -1341,13 +1740,87 @@ async def cmd_artist(client, db, args):
         err.print(f"Using saved plan {path} ({plan['songs']} songs)")
     else:
         await prepare(client, db, args)
-        plan, path = await build_plan(client, db, args.names, verify=args.verify, stereo=args.stereo)
+        plan, path = await build_plan(client, db, args.names, verify=args.verify, stereo=args.stereo, args=args)
         if args.json:
             print(json.dumps(plan | {"plan_file": str(path)}, ensure_ascii=False, indent=1))
         else:
             show_plan(plan, path)
     if args.download:
         await run_plan(client, db, plan)
+
+
+async def cmd_albums(client, db, args):
+    """Find albums by name or artist. Unnamed runs in the results get named from one track's tags (~130 KB)."""
+    await prepare(client, db, args)
+    items = filter_items(apply_probes(db, load_items(db, args.chat)), args)
+    albums = album_index(items)
+
+    track_refs = {it["ref"] for it in match(items, args.queries, min_score=101)} if args.queries else set()  # exact/prefix words only
+
+    def hits():
+        found = match_albums(albums, args.queries, args.artist) if args.queries else []
+        keys = {a["key"] for a in found}
+        # albums with a matching track (e.g. a still-unnamed run containing "05. Vaazhanum Baththa.flac")
+        found += [a for a in albums.values() if a["key"] not in keys and any(i["ref"] in track_refs for i in a["items"])]
+        who = args.artist or (args.queries[0] if args.queries else None)
+        if who:  # also albums by an artist of that name (covers still-unnamed runs)
+            keys = {a["key"] for a in found}
+            found += [a for a in albums.values() if a["key"] not in keys and
+                      any(fuzz.partial_ratio(norm_text(who), norm_text(x)) >= 90 for x in a["artists"])]
+        return sorted(found, key=lambda a: (a["source"] == "run", -len(a["items"])))[:args.limit]
+
+    found = hits()
+    if any(a["source"] == "run" for a in found):
+        await name_albums(client, db, found)
+        albums = album_index(items)
+        found = hits()
+    rows = [album_summary(a) for a in found]
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=1))
+        return
+    table = Table(header_style="bold")
+    for col in ("#", "Album", "Artist", "Songs", "Missing", "Best", "Size", "Channel"):
+        table.add_column(col, no_wrap=col in ("#", "Songs", "Size"))
+    for i, r in enumerate(rows):
+        table.add_row(str(i), r["album"] + ("" if r["source"] != "run" else " [dim](untitled)[/]"), r["artist"][:30],
+                      f"{r['songs']} ({r['lossless']} lossless)", ",".join(map(str, r["missing"][:6])) or "-",
+                      " ".join(r["best_labels"][:2]), f"{r['size_mb']:.0f}MB", r["chats"][0][:22] if r["chats"] else "")
+    out.print(table)
+    out.print('Plan one or more: hifigram.py album "Album A" "Album B|alt spelling" --plan --verify')
+
+
+async def cmd_album(client, db, args):
+    """One plan per album name ("Name|alt spelling" for variants); --download downloads them all."""
+    albums = None
+    for spec in args.names:
+        variants = [v.strip() for v in spec.split("|") if v.strip()]
+        path = PLANS / f"album-{slug(variants[0])}.json"
+        if args.download and path.exists() and not args.replan:
+            plan = json.loads(path.read_text())
+            err.print(f"Using saved plan {path} ({plan['songs']} songs)")
+        else:
+            if albums is None:
+                await prepare(client, db, args)
+                items = filter_items(apply_probes(db, load_items(db)), args)
+                albums = album_index(items)
+            found = match_albums(albums, variants, args.artist)
+            # film songs are often posted inside compilations or as singles: collect tracks marked "(From X)" too
+            keys = {album_norm(v) for v in variants}
+            loose = [i for i in items if album_norm(from_hint(i) or "") in keys]
+            if not found and not loose:
+                err.print(f'[red]No album matching[/] "{spec}". Try: hifigram.py albums "{variants[0]}"')
+                continue
+            name = max(found, key=lambda a: (a["source"] == "tag", len(a["items"])))["name"] if found else variants[0]
+            refs = {i["ref"] for a in found for i in a["items"]}
+            # a loose track's number belongs to the compilation it came from, not to this album
+            tracks = [i for a in found for i in a["items"]] + [i | {"album_track": None} for i in loose if i["ref"] not in refs]
+            plan, path = await plan_from_items(client, db, tracks, name, variants, "album", args.verify, args.stereo, args)
+            if args.json:
+                print(json.dumps(plan | {"plan_file": str(path)}, ensure_ascii=False, indent=1))
+            else:
+                show_plan(plan, path)
+        if args.download:
+            await run_plan(client, db, plan)
 
 
 async def cmd_stats(client, db, args):
@@ -1360,6 +1833,22 @@ async def cmd_stats(client, db, args):
     for r in db.execute("SELECT c.title, COUNT(*) n FROM files f JOIN chats c ON c.chat_id=f.chat_id "
                         "GROUP BY f.chat_id ORDER BY n DESC LIMIT 15"):
         out.print(f"  {r['n']:>7}  {r['title']}")
+    if getattr(args, "categories", False):
+        from collections import Counter
+        items = apply_probes(db, load_items(db))
+        tagged = [it for it in items if it["tags"]]
+        cats = {
+            "format": Counter(it["ext"] for it in items),
+            "language": Counter(lang_of(it) or "unknown" for it in items),
+            "length": Counter(length_bucket(it["duration"]) for it in items),
+            "version": Counter(v for it in items for v in versions_of(it)),
+            f"genre (tags, {len(tagged)} files)": Counter(it["tags"].get("genre", "?") for it in tagged),
+            f"decade (tags, {len(tagged)} files)": Counter(f"{it['tags']['year'] // 10 * 10}s" for it in tagged
+                                                           if it["tags"].get("year")),
+        }
+        for name, c in cats.items():
+            out.print(f"[bold]{name}[/]: " + " · ".join(f"{k} {v:,}" for k, v in c.most_common(12)))
+        out.print(f"albums: {len(album_index(items)):,} (named + numbered runs)")
 
 
 async def interactive(client, db):
@@ -1383,7 +1872,8 @@ async def main():
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("login")
     sub.add_parser("sync")
-    sub.add_parser("stats")
+    st = sub.add_parser("stats")
+    st.add_argument("--categories", action="store_true", help="format/language/length/version/genre/decade/albums")
     s = sub.add_parser("search")
     s.add_argument("queries", nargs="+")
     s.add_argument("--json", action="store_true")
@@ -1393,6 +1883,7 @@ async def main():
     s.add_argument("--offline", action="store_true", help="don't sync first, never call Telegram")
     s.add_argument("--remote", action="store_true", help="also ask Telegram (default: only when index has nothing)")
     s.add_argument("--verify", action="store_true", help="spectrum-check best copies for fakes (~1-5 MB each, cached)")
+    add_filter_args(s)
     s.add_argument("--stereo", action="store_true", help="skip surround (5.1 etc) files")
     t = sub.add_parser("top")
     t.add_argument("n", type=int, nargs="?", default=5)
@@ -1402,6 +1893,7 @@ async def main():
     t.add_argument("--json", action="store_true")
     t.add_argument("--offline", action="store_true")
     t.add_argument("--verify", action="store_true", help="spectrum-check for fakes (~1-5 MB each, cached)")
+    add_filter_args(t)
     t.add_argument("--stereo", action="store_true", help="skip surround (5.1 etc) files")
     v = sub.add_parser("verify")
     v.add_argument("refs", nargs="+")
@@ -1422,6 +1914,26 @@ async def main():
     a.add_argument("--json", action="store_true")
     a.add_argument("--offline", action="store_true")
     a.add_argument("--verify", action="store_true", help="spectrum-check best copy of each song (~1-5 MB each, cached)")
+    add_filter_args(a)
+    al = sub.add_parser("albums")
+    al.add_argument("queries", nargs="*", help="album name(s) or artist")
+    al.add_argument("--artist")
+    al.add_argument("--chat")
+    al.add_argument("--limit", type=int, default=30)
+    al.add_argument("--json", action="store_true")
+    al.add_argument("--offline", action="store_true")
+    add_filter_args(al)
+    ab = sub.add_parser("album")
+    ab.add_argument("names", nargs="+", help='one album per argument; "Name|alt spelling" for variants')
+    ab.add_argument("--artist", help="only albums by this artist (disambiguates common names)")
+    ab.add_argument("--plan", action="store_true", help="build plans only (default)")
+    ab.add_argument("--download", action="store_true", help="download the saved plans (builds missing ones)")
+    ab.add_argument("--replan", action="store_true")
+    ab.add_argument("--verify", action="store_true")
+    ab.add_argument("--stereo", action="store_true")
+    ab.add_argument("--json", action="store_true")
+    ab.add_argument("--offline", action="store_true")
+    add_filter_args(ab)
     a.add_argument("--stereo", action="store_true", help="skip surround (5.1 etc) files")
     # refs like -1001234567890:42 start with "-": move them behind "--" so argparse doesn't read them as options
     argv = sys.argv[1:]
@@ -1433,10 +1945,11 @@ async def main():
     db = open_db()
     if args.cmd == "stats":
         return await cmd_stats(None, db, args)
-    if getattr(args, "offline", False) and args.cmd in ("search", "top", "artist") and not getattr(args, "download", False):
+    if getattr(args, "offline", False) and args.cmd in ("search", "top", "artist", "albums", "album") and not getattr(args, "download", False):
         if not synced_once(db) and not db.execute("SELECT 1 FROM files LIMIT 1").fetchone():
             sys.exit("Index empty. Run: hifigram.py sync")
-        return await {"search": cmd_search, "top": cmd_top, "artist": cmd_artist}[args.cmd](None, db, args)
+        return await {"search": cmd_search, "top": cmd_top, "artist": cmd_artist, "albums": cmd_albums,
+                      "album": cmd_album}[args.cmd](None, db, args)
     with client_lock():
         await run_command(args, db)
 
@@ -1457,6 +1970,10 @@ async def run_command(args, db):
             await cmd_get(client, db, args)
         elif args.cmd == "artist":
             await cmd_artist(client, db, args)
+        elif args.cmd == "albums":
+            await cmd_albums(client, db, args)
+        elif args.cmd == "album":
+            await cmd_album(client, db, args)
         elif args.cmd == "verify":
             await cmd_verify(client, db, args)
         elif args.cmd == "channels":
