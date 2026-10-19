@@ -1119,7 +1119,7 @@ async def ensure_probed(client, db, items, need=()):
 # A spectrogram PNG is saved for every check (spectrograms/<doc_id>.png). Results are cached per document;
 # downloaded files are checked locally for free.
 
-VERIFY_VERSION = 2
+VERIFY_VERSION = 3  # bump when verify improves: earlier failures (no result) get retried, successes are kept
 SAMPLE_POINTS = (0.35, 0.65)
 SAMPLE_SECONDS = 4.5  # fetched per point; 3.5 s of it is decoded
 SPECTRO_DIR = HERE / "spectrograms"
@@ -1328,7 +1328,8 @@ async def verify_items(client, db, items):
     """Spectrum-verify lossless items never verified (with current code) before; cache every result."""
     if client is None:
         return
-    done = {r["doc_id"] for r in db.execute("SELECT doc_id FROM verify WHERE version>=?", (VERIFY_VERSION,))}
+    done = {r["doc_id"] for r in db.execute("SELECT doc_id FROM verify WHERE result IS NOT NULL OR version>=?",
+                                            (VERIFY_VERSION,))}
     need = {}
     for it in items:
         if it["lossless"] and it["ext"] not in ("dsf", "dff") and it["doc_id"] not in done:  # DSD: no PCM spectrum test
