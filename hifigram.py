@@ -1423,7 +1423,12 @@ async def main():
     a.add_argument("--offline", action="store_true")
     a.add_argument("--verify", action="store_true", help="spectrum-check best copy of each song (~1-5 MB each, cached)")
     a.add_argument("--stereo", action="store_true", help="skip surround (5.1 etc) files")
-    args = p.parse_args()
+    # refs like -1001234567890:42 start with "-": move them behind "--" so argparse doesn't read them as options
+    argv = sys.argv[1:]
+    refs = [a for a in argv if re.fullmatch(r"-\d+:\d+", a)]
+    if refs and "--" not in argv:
+        argv = [a for a in argv if a not in refs] + ["--"] + refs
+    args = p.parse_args(argv)
 
     db = open_db()
     if args.cmd == "stats":
