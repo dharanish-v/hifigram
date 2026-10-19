@@ -146,7 +146,7 @@ def byte_store():
     return _BYTES
 
 
-async def get_blocks(client, doc, first, last):
+async def get_blocks(client, doc, first, last, counter=None):
     """Blocks first..last of a document: from the byte cache, fetching only missing runs (then cached)."""
     st, blocks, missing = byte_store(), {}, []
     for i in range(first, last + 1):
@@ -169,6 +169,8 @@ async def get_blocks(client, doc, first, last):
             blocks[k] = data
             st.put(doc.id, k, data)
             NET["bytes"] += len(data)
+            if counter is not None:
+                counter["bytes"] = counter.get("bytes", 0) + len(data)
             k += 1
     return blocks
 
@@ -181,9 +183,9 @@ class RemoteFile:
         self.size, self.pos, self.blocks, self.fetched = doc.size, 0, {}, 0
 
     async def _fetch(self, i):
-        before = NET["bytes"]
-        data = (await get_blocks(self.client, self.doc, i, i)).get(i, b"")
-        self.fetched += NET["bytes"] - before  # network bytes only; cache hits are free
+        ctr = {}
+        data = (await get_blocks(self.client, self.doc, i, i, ctr)).get(i, b"")
+        self.fetched += ctr.get("bytes", 0)  # network bytes only; cache hits are free
         return data
 
     def _block(self, i):
@@ -667,6 +669,7 @@ CREATE INDEX IF NOT EXISTS post_meta_date ON post_meta(chat_id, date);
 CREATE TABLE IF NOT EXISTS views_history(chat_id INTEGER, msg_id INTEGER, at INTEGER, views INTEGER, forwards INTEGER,
   replies INTEGER, PRIMARY KEY(chat_id, msg_id, at));
 CREATE TABLE IF NOT EXISTS events(at INTEGER, kind TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS languages(ref TEXT PRIMARY KEY, lang TEXT, conf REAL, why TEXT, version INTEGER);
 """
 PROBE_VERSION = 4  # bump when probe code improves: failed probes from older versions get retried
 FILTERS = {"all": None}  # chat scans take every message (text, photos, audio, service...), not just audio
@@ -1007,6 +1010,7 @@ def assess(item, info, ver=None):
     lossless = ext in LOSSLESS or bool((info or {}).get("alac"))
     item["kbps"], item["lossless"] = kbps, lossless
     item["tags"] = (info or {}).get("tags") or {}
+    item["all_tags"] = (info or {}).get("all_tags") or {}
     if lossless and (info or {}).get("dsd"):  # DSD64 = 2.8224 MHz 1-bit; ranked like the PCM rate it resolves
         sr = info["sample_rate"]
         item["label"] = f"DSD{round(sr / 44100)}"
@@ -1154,9 +1158,9 @@ def audio_layout(f, ext):
     return None
 
 
-async def fetch_range(client, doc, offset, length):
+async def fetch_range(client, doc, offset, length, counter=None):
     first, last = offset // BLOCK, (offset + length - 1) // BLOCK
-    blocks = await get_blocks(client, doc, first, last)
+    blocks = await get_blocks(client, doc, first, last, counter)
     data = b"".join(blocks.get(i, b"") for i in range(first, last + 1))
     return data[offset - first * BLOCK:offset - first * BLOCK + length]
 
@@ -1246,7 +1250,7 @@ def sample_bytes(info, start, end):
 async def verify_one(client, msg, it, info):
     """Remote: fetch only the two slices (+ headers) and analyse them."""
     loop = asyncio.get_running_loop()
-    net_before = NET["bytes"]
+    ctr = {}
     rf = RemoteFile(client, loop, msg.document, it["file_name"])
     lay = await asyncio.to_thread(audio_layout, rf, it["ext"])
     if not lay or not info or not info.get("sample_rate"):
@@ -1256,12 +1260,14 @@ async def verify_one(client, msg, it, info):
     dur = info.get("length") or it["duration"]
     secs = min(3.5, 0.8 * length / max(end - start, 1) * dur)  # decode only audio we actually fetched
     offs = [start + int((end - start - length) * p) for p in SAMPLE_POINTS]
-    chunks = [await fetch_range(client, msg.document, o, length) for o in offs]
+    chunks = [await fetch_range(client, msg.document, o, length, ctr) for o in offs]
     rf.seek(0)
     samples = []
     with tempfile.TemporaryDirectory() as tmp:
         if it["ext"] == "flac":  # metadata + slice; the decoder resyncs on the next frame
-            head = await asyncio.to_thread(rf.read, start)
+            head = bytearray(await asyncio.to_thread(rf.read, 42))  # "fLaC" + STREAMINFO; pictures etc. skipped
+            head[4] |= 0x80  # mark STREAMINFO as the last metadata block
+            head = bytes(head)
             for i, chunk in enumerate(chunks):
                 path = Path(tmp) / f"{i}.flac"
                 path.write_bytes(head + chunk)
@@ -1272,7 +1278,7 @@ async def verify_one(client, msg, it, info):
                 fh.write(await asyncio.to_thread(rf.read, start + 65536))
                 for off, n in extra:
                     fh.seek(off)
-                    fh.write(await fetch_range(client, msg.document, off, n))
+                    fh.write(await fetch_range(client, msg.document, off, n, ctr))
                 for o, chunk in zip(offs, chunks):
                     fh.seek(o)
                     fh.write(chunk)
@@ -1281,7 +1287,7 @@ async def verify_one(client, msg, it, info):
                 samples.append(await decode(path, dur * ((o - start) + length * 0.1) / (end - start), secs))
     res = await asyncio.to_thread(spectrum_verdict, samples, info["sample_rate"], info.get("bits") or 16)
     if res:
-        res["fetched_mb"] = round((NET["bytes"] - net_before) / 1e6, 2)
+        res["fetched_mb"] = round((ctr.get("bytes", 0) + rf.fetched) / 1e6, 2)
         res["channels"] = samples[0][1]
         await save_spectrogram(samples, info["sample_rate"], it["doc_id"])
     return res
@@ -1572,8 +1578,108 @@ VERSIONS = ("remix", "live", "instrumental", "karaoke", "acoustic", "cover", "un
             "ost", "bgm", "theme", "atmos", "remaster")
 
 
-def lang_of(it):
-    """Script of title/artist (Indic, CJK, Cyrillic...), else a language named in the channel title."""
+# ---------- language detection ----------
+# Signals, strongest first; each adds weight to a language, with the reason kept:
+#   language tag in the file (ID3 TLAN, Vorbis LANGUAGE)       1.0
+#   native script in title/artist (மகளே, తెలుగు, हिंदी...)      0.95
+#   album/movie known to be in a language (propagated)          0.6
+#   artist: single-language seed list (0.7) / multi-language (0.2) / learned from confident tracks (0.5)
+#   romanised words typical of a language (kaadhal, nenjam / prema, nuvvu / dil, pyaar / the, love)   0.25 each, max 0.6
+#   channel name ("Tamil Lossless...")                           0.3 — a hint, never enough alone
+# Results (language, confidence, reasons) are cached per post in the `languages` table.
+
+LANG_VERSION = 1
+LANG_CODES = {"ta": "tamil", "tam": "tamil", "tamil": "tamil", "te": "telugu", "tel": "telugu", "telugu": "telugu",
+              "hi": "hindi", "hin": "hindi", "hindi": "hindi", "ml": "malayalam", "mal": "malayalam",
+              "malayalam": "malayalam", "kn": "kannada", "kan": "kannada", "kannada": "kannada", "en": "english",
+              "eng": "english", "english": "english", "ja": "japanese", "jpn": "japanese", "ko": "korean",
+              "kor": "korean", "ru": "russian", "rus": "russian", "zh": "chinese", "chi": "chinese", "zho": "chinese"}
+ARTIST_SEEDS = {  # (languages, strong). Strong = works (almost) only in that language.
+    "tamil": (["ilaiyaraaja", "ilayaraja", "ilaiyaraja", "isaignani", "yuvan shankar raja", "harris jayaraj",
+               "g v prakash", "gv prakash", "d imman", "santhosh narayanan", "sean roldan", "hiphop tamizha",
+               "deva", "bharathwaj", "sai abhyankkar", "t m soundararajan", "tms", "m s viswanathan", "msv",
+               "vairamuthu", "kannadasan", "na muthukumar", "thamarai", "madhan karky", "vivek", "vijay antony",
+               "ghibran", "govind vasantha", "sam c s", "justin prabhakaran", "dhina", "sirpy", "gangai amaran",
+               "karthik raja", "vidyasagar", "imman", "anthony daasan", "gana", "arivu", "thamizh aadhavan",
+               "mohan kannan", "srinivas", "hariharan", "unni krishnan", "unnikrishnan", "malaysia vasudevan",
+               "p unnikrishnan", "sirkazhi govindarajan", "jikki", "l r eswari", "vani jairam", "charulatha mani",
+               "pradeep kumar", "andrea jeremiah", "dhanush", "sivakarthikeyan", "silambarasan", "str",
+               "kamal haasan", "rajinikanth", "anirudh"], True),
+    "telugu": (["devi sri prasad", "dsp", "thaman", "s thaman", "mani sharma", "m m keeravani", "keeravani",
+                "mickey j meyer", "anup rubens", "sirivennela", "chandrabose", "ramajogayya sastry", "sid sriram telugu",
+                "koti", "chakri", "ghantasala", "s p charan"], True),
+    "hindi": (["arijit singh", "pritam", "vishal shekhar", "amit trivedi", "lata mangeshkar", "kishore kumar",
+               "mohammed rafi", "asha bhosle", "jubin nautiyal", "atif aslam", "neha kakkar", "shankar ehsaan loy",
+               "r d burman", "kumar sanu", "udit narayan", "alka yagnik", "javed akhtar", "gulzar", "sachet parampara"], True),
+    "malayalam": (["sushin shyam", "bijibal", "m jayachandran", "vineeth sreenivasan", "shaan rahman",
+                   "rex vijayan", "k s harisankar"], True),
+    "kannada": (["arjun janya", "v harikrishna", "ajaneesh loknath", "rajesh krishnan", "hamsalekha"], True),
+    "multi": (["a r rahman", "ar rahman", "s p balasubrahmanyam", "s p balasubramaniam", "spb", "s p b",
+               "k s chithra", "ks chithra", "chithra", "k j yesudas", "yesudas", "p susheela", "s janaki",
+               "sid sriram", "shreya ghoshal", "sonu nigam", "shankar mahadevan", "karthik", "haricharan",
+               "harini", "chinmayi", "swetha mohan", "shweta mohan", "vijay yesudas", "benny dayal", "naresh iyer",
+               "sunidhi chauhan", "kailash kher", "gopi sundar", "santhosh", "mano", "sujatha", "anuradha sriram"], False),
+}
+LEXICON = {
+    "tamil": {"kaadhal", "kadhal", "kaathal", "nenjam", "nenje", "penne", "kanne", "kanmani", "uyire", "uyir",
+              "azhagu", "azhagi", "azhage", "vaa", "naan", "nee", "unnai", "ennai", "mazhai", "nila", "nilave",
+              "thendral", "poove", "poo", "chellam", "chella", "magale", "magal", "amma", "thalaivaa", "kuthu",
+              "paattu", "pattu", "vaanam", "megam", "idhayam", "mudhal", "kannil", "kannukulla", "oru", "ennodu",
+              "unakku", "enakku", "unnodu", "kaathirunthen", "raasa", "raasathi", "machan", "machi", "vaadi",
+              "podi", "aaha", "adiye", "yaaro", "yaar", "ponnu", "thaane", "kanavu", "kangal", "vizhi", "manam",
+              "nenjil", "kaadhalan", "kaadhali", "thangame", "thanga", "senthamizh", "tamizh", "thamizh", "vaazhkai",
+              "anbe", "anbu", "malare", "malar", "thaai", "thaaye", "kanna", "kannamma", "rasa", "rasathi",
+              "solla", "sollu", "paadum", "paadu", "aattam", "kaatre", "kaatru", "santhana", "mullai", "raasaave",
+              "vaanambaadi", "azhagiya", "nathiyena", "pathikichu", "naan", "thaan", "unna", "ennithan"},
+    "telugu": {"prema", "nuvvu", "nenu", "ninne", "pilla", "chinni", "gundello", "manasu", "naa", "nee",
+               "ammayi", "abbayi", "andam", "andala", "kalalo", "vela", "cheli", "priya", "raave", "ra", "emo",
+               "yemaindi", "oohalu", "ninnu", "naalo", "neelo", "jagame", "kotha", "bangaram", "manasaa"},
+    "hindi": {"dil", "pyaar", "pyar", "ishq", "mera", "meri", "tera", "teri", "hai", "kya", "tum", "tumhe",
+              "jaana", "mohabbat", "sajna", "yaar", "zindagi", "jaan", "aankhen", "sapna", "humko", "tujhe",
+              "mujhe", "kahin", "raat", "chand", "bahon", "bin", "hawa", "dilbar", "mahiya", "saiyaan", "ke", "se"},
+    "malayalam": {"ponne", "ente", "ninte", "pranayam", "kanmani", "mazha", "ormakal", "sundari", "kaattu"},
+    "english": {"the", "love", "you", "me", "my", "of", "in", "and", "night", "heart", "baby", "your", "with",
+                "for", "this", "what", "when", "girl", "time", "dance", "life", "light", "dream", "never",
+                "forever", "remaster", "remastered", "feat", "live", "version", "edit", "mix"},
+}
+
+
+def _seed_index():
+    idx = {}
+    for lang, (names, strong) in ARTIST_SEEDS.items():
+        for n in names:
+            idx[n.replace(" ", "")] = (lang, strong)
+    return idx
+
+
+SEEDS = _seed_index()
+SEED_PREFIX = {}
+for _k, _v in SEEDS.items():
+    if len(_k) > 5:
+        SEED_PREFIX.setdefault(_k[:6], []).append((_k, _v))
+
+
+def artist_parts(it):
+    raw = " , ".join(filter(None, [it["performer"], (it.get("tags") or {}).get("albumartist"),
+                                   (it.get("tags") or {}).get("artist")]))
+    parts = re.split(r"\s*(?:,|&|;|/|\bfeat\.?|\bft\.?|\band\b|\bwith\b|\bx\b)\s*", unicodedata.normalize("NFKC", raw).lower())
+    return {re.sub(r"[^a-z0-9]", "", p) for p in parts if p.strip()}
+
+
+def lang_signals(it, album_lang=None, learned=None):
+    """-> {language: weight}, [reasons]"""
+    score, why = {}, []
+
+    def add(lang, w, reason):
+        score[lang] = score.get(lang, 0) + w
+        why.append(f"{reason}→{lang}")
+
+    info_tags = it.get("all_tags") or {}
+    for key in ("TLAN", "LANGUAGE", "----:com.apple.iTunes:LANGUAGE"):
+        val = info_tags.get(key)
+        val = val[0] if isinstance(val, list) and val else val
+        if isinstance(val, str) and LANG_CODES.get(val.strip().lower()[:8]):
+            add(LANG_CODES[val.strip().lower()[:8]], 1.0, f"tag:{val}")
     counts = {}
     for ch in unicodedata.normalize("NFKC", f"{it['title']} {it['performer']} {it['file_name']}"):
         o = ord(ch)
@@ -1581,9 +1687,81 @@ def lang_of(it):
             if a <= o <= b:
                 counts[name] = counts.get(name, 0) + 1
     if counts:
-        return max(counts, key=counts.get)
+        add(max(counts, key=counts.get), 0.95, "script")
+    if album_lang:
+        add(album_lang, 0.6, "album")
+    for part in artist_parts(it):
+        seed = SEEDS.get(part) or next((v for k, v in SEED_PREFIX.get(part[:6], ()) if part.startswith(k)), None)
+        if seed:
+            lang, strong = seed
+            if lang == "multi":
+                for l in ("tamil", "telugu", "hindi", "malayalam"):
+                    score[l] = score.get(l, 0) + 0.05  # tie-break nudge only
+                why.append(f"artist:{part}(multi)")
+            else:
+                add(lang, 0.7 if strong else 0.2, f"artist:{part}")
+        elif learned and part in learned:
+            add(learned[part], 0.5, f"learned-artist:{part}")
+    words = set(norm_text(f"{it['title']} {Path(it['file_name']).stem}").split())
+    for lang, lex in LEXICON.items():
+        hits = sorted(words & lex)
+        if hits:
+            add(lang, min(0.6, 0.25 * len(hits)), f"words:{','.join(hits[:3])}")
     chat = it["chat"].lower()
-    return next((lang for lang in LANGS if lang in chat), "")
+    for lang in LANGS:
+        if lang in chat:
+            add(lang, 0.3, "channel")
+    return score, why
+
+
+def decide(score):
+    if not score:
+        return "", 0.0
+    lang = max(score, key=score.get)
+    total = sum(score.values())
+    return lang, round(min(1.0, score[lang]) * (score[lang] / total), 2)
+
+
+def compute_languages(db, items):
+    """Two passes: (1) per-post signals; albums and artists learn their language from confident posts;
+    (2) propagate album and learned-artist languages back to every post. Cached in `languages`."""
+    from collections import Counter, defaultdict
+    cached = {r["ref"]: r for r in db.execute("SELECT ref, lang, conf, why FROM languages WHERE version=?", (LANG_VERSION,))}
+    todo = [it for it in items if it["ref"] not in cached]
+    if todo:
+        first = {}
+        album_votes, artist_votes = defaultdict(Counter), defaultdict(Counter)
+        for it in todo:
+            score, why = lang_signals(it)
+            lang, conf = decide(score)
+            first[it["ref"]] = (lang, conf)
+            if conf >= 0.6 and lang:
+                hint = album_hint(it)[0]
+                if hint:
+                    album_votes[album_norm(hint)][lang] += 1
+                for part in artist_parts(it):
+                    artist_votes[part][lang] += 1
+        album_lang = {k: c.most_common(1)[0][0] for k, c in album_votes.items()
+                      if c.most_common(1)[0][1] >= 2 and c.most_common(1)[0][1] / sum(c.values()) >= 0.75}
+        learned = {a: c.most_common(1)[0][0] for a, c in artist_votes.items()
+                   if c.most_common(1)[0][1] >= 5 and c.most_common(1)[0][1] / sum(c.values()) >= 0.8}
+        rows = []
+        for it in todo:
+            hint = album_hint(it)[0]
+            score, why = lang_signals(it, album_lang.get(album_norm(hint)) if hint else None, learned)
+            lang, conf = decide(score)
+            rows.append((it["ref"], lang, conf, "; ".join(why)[:500], LANG_VERSION))
+            cached[it["ref"]] = {"lang": lang, "conf": conf, "why": "; ".join(why)[:500]}
+        db.executemany("INSERT OR REPLACE INTO languages VALUES(?,?,?,?,?)", rows)
+        db.commit()
+    for it in items:
+        c = cached[it["ref"]]
+        it["lang"], it["lang_conf"], it["lang_why"] = c["lang"], c["conf"], c["why"]
+    return items
+
+
+def lang_of(it):
+    return it.get("lang") or ""
 
 
 def versions_of(it):
@@ -1604,11 +1782,14 @@ def needs(args):
 
 def filter_items(items, args):
     """--format/--lang/--version/--length work on the index; --genre/--decade need file tags (read on probe)."""
+    if getattr(args, "lang", None) and items and "lang" not in items[0]:
+        compute_languages(open_db(), items)
     if getattr(args, "format", None):
         fmts = {f.strip().lower() for f in args.format.split(",")}
         items = [it for it in items if it["ext"] in fmts or (it["ext"] == "m4a" and "alac" in fmts and it.get("label", "").startswith("ALAC"))]
     if getattr(args, "lang", None):
-        items = [it for it in items if lang_of(it) == args.lang.lower()]
+        floor = 0.2 if getattr(args, "loose", False) else 0.45
+        items = [it for it in items if lang_of(it) == args.lang.lower() and it.get("lang_conf", 0) >= floor]
     if getattr(args, "version", None):
         want = {v.strip().lower() for v in args.version.split(",")}
         items = [it for it in items if want & set(versions_of(it))]
@@ -1632,12 +1813,15 @@ def filter_tags(items, args):
 
 def add_filter_args(sp):
     sp.add_argument("--format", help="comma list: flac,wav,alac,dsf,mp3,...")
-    sp.add_argument("--lang", help="tamil, telugu, hindi, japanese, russian, ... (script or channel name)")
+    sp.add_argument("--lang", help="tamil, telugu, hindi, malayalam, english, japanese, ... (tags, script, album, "
+                                   "artist, words, channel; see `inspect` for the reasons)")
+    sp.add_argument("--loose", action="store_true", help="with --lang: include weak matches (e.g. channel name only)")
     sp.add_argument("--version", help="only these versions: instrumental,remix,live,karaoke,acoustic,ost,...")
     sp.add_argument("--no-version", help="exclude these versions, e.g. karaoke,remix")
     sp.add_argument("--length", choices=("short", "song", "long", "mix"), help="<1 min, 1-6, 6-15, >15 min")
     sp.add_argument("--genre", help="from file tags (read on header check)")
     sp.add_argument("--decade", help="e.g. 1990s, from file tags")
+    sp.add_argument("--no-sync", action="store_true", help="use the index as is (still checks headers/fakes online)")
 
 
 # ---------- albums ----------
@@ -1968,7 +2152,7 @@ async def cmd_verify(client, db, args):
 
 async def prepare(client, db, args):
     """Cheap incremental sync before local queries (unchanged chats cost nothing)."""
-    if getattr(args, "offline", False) or client is None:
+    if getattr(args, "offline", False) or getattr(args, "no_sync", False) or client is None:
         return
     await sync(client, db)
 
@@ -2195,7 +2379,8 @@ async def cmd_stats(client, db, args):
         tagged = [it for it in items if it["tags"]]
         cats = {
             "format": Counter(it["ext"] for it in items),
-            "language": Counter(lang_of(it) or "unknown" for it in items),
+            "language": Counter((lang_of(it) if it["lang_conf"] >= 0.45 else "") or "unknown"
+                                for it in compute_languages(db, items)),
             "length": Counter(length_bucket(it["duration"]) for it in items),
             "version": Counter(v for it in items for v in versions_of(it)),
             f"genre (tags, {len(tagged)} files)": Counter(it["tags"].get("genre", "?") for it in tagged),
